@@ -119,7 +119,7 @@ export const boardHtml = `<!doctype html>
   <input id="size" type="range" min="2" max="24" value="4" title="太さ">
   <button id="pen" class="tool active" title="ペン">&#9998; ペン</button>
   <button id="eraser" class="tool" title="消しゴム">&#9723; 消しゴム</button>
-  <button id="text" class="tool" title="テキスト($...$ でTeX数式)">T テキスト</button>
+  <button id="text" class="tool" title="テキスト($...$ でTeX数式)。既存テキストをクリックで編集">T テキスト</button>
   <button id="share" class="tool" title="URLをコピー">URLをコピー</button>
   <span id="status"></span>
   <span id="users"></span>
@@ -157,7 +157,7 @@ var pendingPts = [];     // 未送信の点
 var eraseIds = [];       // 未送信の消去ID
 var lastCursor = 0;
 var lastPt = null;       // 最後のポインタ位置(仮想座標)
-var editing = null;      // テキスト編集中の配置位置 {x, y}
+var editing = null;      // テキスト編集中 {x, y, item} (item は再編集対象、新規は null)
 var itemEls = {};        // テキストアイテム id -> DOM要素
 var ERASE_R = 14;        // 消しゴム半径(仮想座標)
 
@@ -338,7 +338,8 @@ function handle(m) {
     case "stroke:end":
       delete live[m.stroke.id];
       if (m.pageId === cur) {
-        strokes.push(m.stroke);
+        if (m.stroke.kind === "text") upsertText(m.stroke);
+        else strokes.push(m.stroke);
         redrawBase();
         renderItems();
       }
@@ -469,7 +470,7 @@ topC.addEventListener("pointerdown", function (e) {
   var pt = toVirtual(e);
   if (tool === "text") {
     e.preventDefault();
-    openEditor(pt);
+    openEditor(pt, findTextAt(pt));
     return;
   }
   topC.setPointerCapture(e.pointerId);
@@ -562,6 +563,32 @@ function renderItems() {
   }
 }
 
+// 同一IDのテキストがあれば置き換え、なければ追加する。
+// 古いDOM要素は捨てて renderItems に作り直させる。
+function upsertText(item) {
+  var found = false;
+  for (var i = 0; i < strokes.length; i++) {
+    if (strokes[i].id === item.id) { strokes[i] = item; found = true; break; }
+  }
+  if (!found) strokes.push(item);
+  if (itemEls[item.id]) {
+    itemEls[item.id].remove();
+    delete itemEls[item.id];
+  }
+}
+
+function findTextAt(pt) {
+  for (var i = strokes.length - 1; i >= 0; i--) {
+    var s = strokes[i];
+    if (s.kind !== "text") continue;
+    var el = itemEls[s.id];
+    var w = el ? el.offsetWidth : 100;
+    var h = el ? el.offsetHeight : s.size * 1.5;
+    if (pt[0] >= s.x && pt[0] <= s.x + w && pt[1] >= s.y && pt[1] <= s.y + h) return s;
+  }
+  return null;
+}
+
 function addTextItem(pt, text) {
   var item = {
     id: newId(), kind: "text", x: pt[0], y: pt[1],
@@ -572,32 +599,66 @@ function addTextItem(pt, text) {
   send({ type: "stroke:end", pageId: cur, stroke: item });
 }
 
-function openEditor(pt) {
-  editing = { x: pt[0], y: pt[1] };
-  editor.style.left = (view.ox + pt[0] * view.scale) + "px";
-  editor.style.top = (view.oy + pt[1] * view.scale) + "px";
-  editor.style.fontSize = (textSize() * view.scale) + "px";
-  editor.style.color = penColor;
-  editor.value = "";
+function openEditor(pt, item) {
+  var x = item ? item.x : pt[0];
+  var y = item ? item.y : pt[1];
+  editing = { x: x, y: y, item: item || null };
+  editor.style.left = (view.ox + x * view.scale) + "px";
+  editor.style.top = (view.oy + y * view.scale) + "px";
+  editor.style.fontSize = ((item ? item.size : textSize()) * view.scale) + "px";
+  editor.style.color = item ? item.color : penColor;
+  editor.value = item ? item.text : "";
   editor.style.display = "block";
+  // 編集中は元のアイテムを隠して二重表示を避ける
+  if (item && itemEls[item.id]) itemEls[item.id].style.visibility = "hidden";
   setTimeout(function () { editor.focus(); }, 0);
+}
+
+function cancelEditor() {
+  if (!editing) return;
+  if (editing.item && itemEls[editing.item.id]) {
+    itemEls[editing.item.id].style.visibility = "";
+  }
+  editing = null;
+  editor.style.display = "none";
 }
 
 function commitEditor() {
   if (!editing) return;
-  var pos = editing;
+  var ed = editing;
   var text = editor.value.trimEnd();
   editing = null;
   editor.style.display = "none";
-  if (text.length > 0) addTextItem([pos.x, pos.y], text);
+  if (!ed.item) {
+    if (text.length > 0) addTextItem([ed.x, ed.y], text);
+    return;
+  }
+  var old = ed.item;
+  if (text.length === 0) {
+    // 空にして確定 → アイテムを削除
+    strokes = strokes.filter(function (s) { return s.id !== old.id; });
+    if (itemEls[old.id]) { itemEls[old.id].remove(); delete itemEls[old.id]; }
+    send({ type: "erase", pageId: cur, ids: [old.id] });
+    return;
+  }
+  if (text === old.text) {
+    if (itemEls[old.id]) itemEls[old.id].style.visibility = "";
+    return;
+  }
+  var updated = {
+    id: old.id, kind: "text", x: old.x, y: old.y,
+    text: text, color: old.color, size: old.size, t: old.t
+  };
+  upsertText(updated);
+  renderItems();
+  send({ type: "stroke:end", pageId: cur, stroke: updated });
 }
 
 editor.addEventListener("blur", commitEditor);
 editor.addEventListener("keydown", function (e) {
   e.stopPropagation();
   if (e.key === "Escape") {
-    editing = null;
-    editor.style.display = "none";
+    cancelEditor();
   } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
     commitEditor();
   }
