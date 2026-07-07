@@ -48,6 +48,7 @@ export const boardHtml = `<!doctype html>
     cursor: pointer;
   }
   .tool.active { background: #2563eb; }
+  .tool:disabled { opacity: 0.4; cursor: default; }
   #size { width: 90px; }
   #users { display: flex; gap: 4px; margin-left: auto; align-items: center; }
   .userdot {
@@ -129,8 +130,9 @@ export const boardHtml = `<!doctype html>
   <span id="colors"></span>
   <input id="size" type="range" min="2" max="24" value="4" title="太さ">
   <button id="pen" class="tool active" title="ペン">&#9998; ペン</button>
-  <button id="eraser" class="tool" title="消しゴム">&#9723; 消しゴム</button>
+  <button id="eraser" class="tool" title="消しゴム。ドラッグで線を消す / テキストはタップで削除">&#9723; 消しゴム</button>
   <button id="text" class="tool" title="テキスト($...$ でTeX数式)。クリックで編集 / ドラッグで移動 / 右下角でサイズ変更">T テキスト</button>
+  <button id="undo" class="tool" title="元に戻す(Ctrl+Z)。自分の操作のみ" disabled>&#8630; 戻す</button>
   <button id="share" class="tool" title="URLをコピー">URLをコピー</button>
   <span id="status"></span>
   <span id="users"></span>
@@ -173,6 +175,11 @@ var itemEls = {};        // テキストアイテム id -> DOM要素
 var textDrag = null;     // テキストのドラッグ中 {item, mode, start, origX, origY, origSize}
 var lastTextUpd = 0;     // text:update の送信スロットル
 var HANDLE = 16;         // リサイズハンドルの判定幅(仮想座標)
+// 自分の操作の取り消し情報。1エントリ = {pageId, added:[id], removed:[item]}
+// undo = added を消して removed を復元(同一IDは stroke:end の上書きで戻る)
+var undoStack = [];
+var eraseOp = null;      // 消しゴム1ジェスチャ分の undo 記録(pointerup で確定)
+var UNDO_MAX = 100;
 var ERASE_R = 14;        // 消しゴム半径(仮想座標)
 
 var baseC = document.getElementById("base");
@@ -457,21 +464,28 @@ function textHit(s, pt) {
     pt[1] >= s.y - ERASE_R && pt[1] <= s.y + h + ERASE_R;
 }
 
+// テキストの削除はタップ(pointerdown)時のみ。ドラッグで掃いても消えないので、
+// テキストと重なったストロークだけを狙って消せる。topmost の1つを消す。
+function eraseTextAt(pt) {
+  for (var i = strokes.length - 1; i >= 0; i--) {
+    var s = strokes[i];
+    if (s.kind === "text" && textHit(s, pt)) {
+      strokes.splice(i, 1);
+      eraseIds.push(s.id);
+      if (eraseOp) eraseOp.removed.push(s);
+      renderItems();
+      return true;
+    }
+  }
+  return false;
+}
+
 function eraseAt(pt) {
   var changed = false;
   var kept = [];
   for (var i = 0; i < strokes.length; i++) {
     var s = strokes[i];
-    if (s.kind === "text") {
-      // テキスト・数式は部分消去せず、触れたら丸ごと消す
-      if (textHit(s, pt)) {
-        eraseIds.push(s.id);
-        changed = true;
-      } else {
-        kept.push(s);
-      }
-      continue;
-    }
+    if (s.kind === "text") { kept.push(s); continue; }
     var hit = false;
     for (var j = 0; j < s.pts.length; j++) {
       var a = s.pts[j], b = s.pts[Math.min(j + 1, s.pts.length - 1)];
@@ -482,9 +496,16 @@ function eraseAt(pt) {
     if (runs === null) { kept.push(s); continue; }
     changed = true;
     eraseIds.push(s.id);
+    if (eraseOp) {
+      // このジェスチャ内で生まれた断片の再分割なら、断片を復元対象にしない
+      var ai = eraseOp.added.indexOf(s.id);
+      if (ai >= 0) eraseOp.added.splice(ai, 1);
+      else eraseOp.removed.push(s);
+    }
     for (var k = 0; k < runs.length; k++) {
       var frag = { id: newId(), color: s.color, size: s.size, pts: runs[k], t: s.t };
       kept.push(frag);
+      if (eraseOp) eraseOp.added.push(frag.id);
       send({ type: "stroke:end", pageId: cur, stroke: frag });
     }
   }
@@ -493,6 +514,55 @@ function eraseAt(pt) {
     redrawBase();
     renderItems();
   }
+}
+
+/* ---------- undo(自分の操作のみ) ---------- */
+function pushUndo(op) {
+  undoStack.push(op);
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
+  updateUndoUI();
+}
+
+function flushEraseOp() {
+  if (eraseOp && (eraseOp.added.length > 0 || eraseOp.removed.length > 0)) {
+    pushUndo(eraseOp);
+  }
+  eraseOp = null;
+}
+
+function updateUndoUI() {
+  document.getElementById("undo").disabled = undoStack.length === 0;
+}
+
+function doUndo() {
+  var op = undoStack.pop();
+  if (!op) return;
+  updateUndoUI();
+  var restoreIds = {};
+  op.removed.forEach(function (it) { restoreIds[it.id] = true; });
+  // added のうち removed と同一IDのものは stroke:end の上書きで戻るので erase 不要
+  var delIds = op.added.filter(function (id) { return !restoreIds[id]; });
+  if (delIds.length > 0) send({ type: "erase", pageId: op.pageId, ids: delIds });
+  op.removed.forEach(function (it) {
+    send({ type: "stroke:end", pageId: op.pageId, stroke: it });
+  });
+  if (op.pageId !== cur) return; // 別ページの操作はサーバー経由で反映される
+  if (delIds.length > 0) {
+    strokes = strokes.filter(function (s) { return delIds.indexOf(s.id) < 0; });
+  }
+  op.removed.forEach(function (it) {
+    if (it.kind === "text") {
+      upsertText(it);
+    } else {
+      var found = false;
+      for (var i = 0; i < strokes.length; i++) {
+        if (strokes[i].id === it.id) { strokes[i] = it; found = true; break; }
+      }
+      if (!found) strokes.push(it);
+    }
+  });
+  redrawBase();
+  renderItems();
 }
 
 topC.addEventListener("pointerdown", function (e) {
@@ -522,7 +592,10 @@ topC.addEventListener("pointerdown", function (e) {
     send({ type: "stroke:start", pageId: cur,
       stroke: { id: drawing.id, color: penColor, size: penSize }, pt: pt });
   } else if (tool === "eraser") {
-    eraseAt(pt);
+    flushEraseOp();
+    eraseOp = { pageId: cur, added: [], removed: [] };
+    // テキストに直接タッチしたらテキストだけを消す。外れたらストローク消去
+    if (!eraseTextAt(pt)) eraseAt(pt);
   }
 });
 
@@ -589,6 +662,12 @@ function endTextDrag() {
   }
   // 最終状態を保存(ドラッグ中は broadcast のみだったので、ここで確定)
   send({ type: "stroke:end", pageId: cur, stroke: d.item });
+  var s = d.item;
+  var before = {
+    id: s.id, kind: "text", x: d.origX, y: d.origY,
+    text: s.text, color: s.color, size: d.origSize, t: s.t
+  };
+  pushUndo({ pageId: cur, added: [s.id], removed: [before] });
 }
 
 function finishStroke() {
@@ -596,6 +675,7 @@ function finishStroke() {
   flushPending();
   strokes.push(drawing);
   send({ type: "stroke:end", pageId: cur, stroke: drawing });
+  pushUndo({ pageId: cur, added: [drawing.id], removed: [] });
   drawing = null;
   redrawBase();
 }
@@ -603,10 +683,12 @@ function finishStroke() {
 topC.addEventListener("pointerup", function () {
   if (textDrag) { endTextDrag(); return; }
   finishStroke();
+  flushEraseOp();
 });
 topC.addEventListener("pointercancel", function () {
   if (textDrag) { endTextDrag(); return; }
   drawing = null;
+  flushEraseOp();
 });
 topC.addEventListener("pointerleave", function () { lastPt = null; });
 
@@ -699,6 +781,7 @@ function addTextItem(pt, text) {
   strokes.push(item);
   renderItems();
   send({ type: "stroke:end", pageId: cur, stroke: item });
+  pushUndo({ pageId: cur, added: [item.id], removed: [] });
 }
 
 function openEditor(pt, item) {
@@ -741,6 +824,7 @@ function commitEditor() {
     strokes = strokes.filter(function (s) { return s.id !== old.id; });
     if (itemEls[old.id]) { itemEls[old.id].remove(); delete itemEls[old.id]; }
     send({ type: "erase", pageId: cur, ids: [old.id] });
+    pushUndo({ pageId: cur, added: [], removed: [old] });
     return;
   }
   if (text === old.text) {
@@ -754,6 +838,7 @@ function commitEditor() {
   upsertText(updated);
   renderItems();
   send({ type: "stroke:end", pageId: cur, stroke: updated });
+  pushUndo({ pageId: cur, added: [updated.id], removed: [old] });
 }
 
 editor.addEventListener("blur", commitEditor);
@@ -854,6 +939,14 @@ function updateToolButtons() {
   document.body.classList.toggle("texttool", tool === "text");
   topC.style.cursor = tool === "text" ? "text" : (tool === "eraser" ? "none" : "crosshair");
 }
+document.getElementById("undo").onclick = doUndo;
+document.addEventListener("keydown", function (e) {
+  // エディタ内は textarea 標準の undo に任せる(editor 側で stopPropagation 済み)
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
+    e.preventDefault();
+    doUndo();
+  }
+});
 document.getElementById("pen").onclick = function () { tool = "pen"; updateToolButtons(); };
 document.getElementById("eraser").onclick = function () { tool = "eraser"; updateToolButtons(); };
 document.getElementById("text").onclick = function () { tool = "text"; updateToolButtons(); };
