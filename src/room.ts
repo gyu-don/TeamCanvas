@@ -1,0 +1,179 @@
+// 1ボード = 1 Durable Object。WebSocket Hibernation API を使い、
+// 接続維持中の課金時間(duration)を抑えて無料枠に収める。
+const USER_COLORS = [
+  "#e11d48",
+  "#2563eb",
+  "#16a34a",
+  "#d97706",
+  "#9333ea",
+  "#0891b2",
+  "#db2777",
+  "#65a30d",
+  "#7c3aed",
+  "#0d9488",
+];
+
+const MAX_PAGES = 50;
+const MAX_STROKE_POINTS = 3000;
+
+interface Stroke {
+  id: string;
+  color: string;
+  size: number;
+  pts: [number, number][];
+  t: number;
+}
+
+interface User {
+  id: string;
+  name: string;
+  color: string;
+}
+
+export class BoardRoom implements DurableObject {
+  constructor(private state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected websocket", { status: 426 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+
+    const seq = ((await this.state.storage.get<number>("userSeq")) ?? 0) + 1;
+    await this.state.storage.put("userSeq", seq);
+    const user: User = {
+      id: crypto.randomUUID().slice(0, 8),
+      name: `ゲスト${seq}`,
+      color: USER_COLORS[(seq - 1) % USER_COLORS.length],
+    };
+    server.serializeAttachment(user);
+    this.state.acceptWebSocket(server);
+
+    const pages = await this.getPages();
+    const users = this.state
+      .getWebSockets()
+      .map((ws) => ws.deserializeAttachment() as User);
+    server.send(JSON.stringify({ type: "init", user, pages, users }));
+    this.broadcast({ type: "join", user }, server);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    if (typeof message !== "string") return;
+    let m: any;
+    try {
+      m = JSON.parse(message);
+    } catch {
+      return;
+    }
+    const user = ws.deserializeAttachment() as User;
+
+    switch (m.type) {
+      case "load": {
+        const strokes = await this.loadStrokes(String(m.pageId));
+        ws.send(
+          JSON.stringify({ type: "pageData", pageId: m.pageId, strokes }),
+        );
+        break;
+      }
+      case "stroke:start":
+      case "stroke:points": {
+        this.broadcast({ ...m, from: user.id }, ws);
+        break;
+      }
+      case "stroke:end": {
+        const s = m.stroke as Stroke;
+        if (
+          s &&
+          typeof s.id === "string" &&
+          Array.isArray(s.pts) &&
+          s.pts.length > 0 &&
+          s.pts.length <= MAX_STROKE_POINTS
+        ) {
+          await this.state.storage.put(`s:${m.pageId}:${s.id}`, s);
+          this.broadcast({ ...m, from: user.id }, ws);
+        }
+        break;
+      }
+      case "erase": {
+        const ids: string[] = Array.isArray(m.ids)
+          ? m.ids.slice(0, 128).map(String)
+          : [];
+        if (ids.length > 0) {
+          await this.state.storage.delete(
+            ids.map((id) => `s:${m.pageId}:${id}`),
+          );
+          this.broadcast({ type: "erase", pageId: m.pageId, ids }, ws);
+        }
+        break;
+      }
+      case "page:add": {
+        const pages = await this.getPages();
+        if (pages.length < MAX_PAGES) {
+          pages.push(crypto.randomUUID().slice(0, 8));
+          await this.state.storage.put("pages", pages);
+          this.broadcast({ type: "pages", pages });
+        }
+        break;
+      }
+      case "cursor": {
+        this.broadcast(
+          {
+            type: "cursor",
+            id: user.id,
+            name: user.name,
+            color: user.color,
+            pageId: m.pageId,
+            x: m.x,
+            y: m.y,
+          },
+          ws,
+        );
+        break;
+      }
+    }
+  }
+
+  webSocketClose(ws: WebSocket) {
+    this.leave(ws);
+  }
+
+  webSocketError(ws: WebSocket) {
+    this.leave(ws);
+  }
+
+  private leave(ws: WebSocket) {
+    const user = ws.deserializeAttachment() as User | null;
+    if (user) this.broadcast({ type: "leave", id: user.id }, ws);
+  }
+
+  private broadcast(msg: unknown, except?: WebSocket) {
+    const s = JSON.stringify(msg);
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === except) continue;
+      try {
+        ws.send(s);
+      } catch {
+        // 切断済みソケットは無視
+      }
+    }
+  }
+
+  private async getPages(): Promise<string[]> {
+    let pages = await this.state.storage.get<string[]>("pages");
+    if (!pages || pages.length === 0) {
+      pages = [crypto.randomUUID().slice(0, 8)];
+      await this.state.storage.put("pages", pages);
+    }
+    return pages;
+  }
+
+  private async loadStrokes(pageId: string): Promise<Stroke[]> {
+    const map = await this.state.storage.list<Stroke>({
+      prefix: `s:${pageId}:`,
+    });
+    return [...map.values()].sort((a, b) => a.t - b.t);
+  }
+}

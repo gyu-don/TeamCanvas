@@ -1,6 +1,22 @@
 # TeamCanvas
 
-Cloudflare Workers + Hono + TypeScript の最小アプリです。
+Cloudflare Workers + Durable Objects で動くページ指向のリアルタイムホワイトボードです(JamBoard 風)。
+
+## 機能
+
+- ページの追加・切り替え(画面下部のタブ)
+- ペン(6色・太さ変更)と消しゴム(ストローク単位で削除)
+- リアルタイム共同編集(1ボードあたり10人未満を想定)
+- 参加者のマーカー(カーソル)位置と名前の表示
+- 「URLをコピー」ボタンで共有。同じ URL を開けば同じボードに参加
+
+## アーキテクチャ
+
+- `src/index.ts` — Hono ルーター。`/` は新規ボードへリダイレクト、`/b/:id` がボード画面、`/b/:id/ws` が WebSocket
+- `src/room.ts` — `BoardRoom` Durable Object(1ボード = 1インスタンス)。WebSocket Hibernation API で接続を保持し、ストロークを DO ストレージ(SQLite)に永続化
+- `src/client.ts` — ボード画面の HTML/JS(Canvas 描画、依存ライブラリなし)
+
+無料枠に収まるよう、Durable Objects は SQLite バックエンド(`new_sqlite_classes`)、WebSocket は Hibernation API を使用し、描画点・カーソルはクライアント側でスロットリングしてメッセージ数を抑えています。
 
 ## Local development
 
@@ -9,7 +25,7 @@ npm install
 npm run dev
 ```
 
-`http://localhost:8787` で `Hello TeamCanvas!` を返します。
+`http://localhost:8787` を開くと新しいボードが作られます。
 
 ## Deploy from GitHub
 
