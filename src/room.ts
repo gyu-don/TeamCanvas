@@ -15,6 +15,7 @@ const USER_COLORS = [
 
 const MAX_PAGES = 50;
 const MAX_STROKE_POINTS = 3000;
+const MAX_TEXT_LEN = 4000;
 
 interface Stroke {
   id: string;
@@ -23,6 +24,20 @@ interface Stroke {
   pts: [number, number][];
   t: number;
 }
+
+// テキスト・TeX数式アイテム(kind: "text")。ストロークと同じキー空間に保存する。
+interface TextItem {
+  id: string;
+  kind: "text";
+  x: number;
+  y: number;
+  text: string;
+  color: string;
+  size: number;
+  t: number;
+}
+
+type BoardItem = Stroke | TextItem;
 
 interface User {
   id: string;
@@ -84,14 +99,23 @@ export class BoardRoom implements DurableObject {
         break;
       }
       case "stroke:end": {
-        const s = m.stroke as Stroke;
-        if (
+        const s = m.stroke as any;
+        const isStroke =
           s &&
           typeof s.id === "string" &&
           Array.isArray(s.pts) &&
           s.pts.length > 0 &&
-          s.pts.length <= MAX_STROKE_POINTS
-        ) {
+          s.pts.length <= MAX_STROKE_POINTS;
+        const isText =
+          s &&
+          typeof s.id === "string" &&
+          s.kind === "text" &&
+          typeof s.text === "string" &&
+          s.text.length > 0 &&
+          s.text.length <= MAX_TEXT_LEN &&
+          typeof s.x === "number" &&
+          typeof s.y === "number";
+        if (isStroke || isText) {
           await this.state.storage.put(`s:${m.pageId}:${s.id}`, s);
           this.broadcast({ ...m, from: user.id }, ws);
         }
@@ -170,8 +194,8 @@ export class BoardRoom implements DurableObject {
     return pages;
   }
 
-  private async loadStrokes(pageId: string): Promise<Stroke[]> {
-    const map = await this.state.storage.list<Stroke>({
+  private async loadStrokes(pageId: string): Promise<BoardItem[]> {
+    const map = await this.state.storage.list<BoardItem>({
       prefix: `s:${pageId}:`,
     });
     return [...map.values()].sort((a, b) => a.t - b.t);

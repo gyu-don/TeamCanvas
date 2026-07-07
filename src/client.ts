@@ -6,6 +6,9 @@ export const boardHtml = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamCanvas</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="katexLoaded()"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; overflow: hidden; }
@@ -79,6 +82,34 @@ export const boardHtml = `<!doctype html>
     font-size: 13px;
   }
   .tab.active { background: #2563eb; color: #fff; }
+  #texlayer {
+    position: absolute;
+    left: 0; top: 0;
+    width: 1600px; height: 1000px;
+    transform-origin: 0 0;
+    pointer-events: none;
+    overflow: hidden;
+  }
+  .textitem {
+    position: absolute;
+    white-space: pre-wrap;
+    max-width: 900px;
+    line-height: 1.45;
+  }
+  #editor {
+    position: absolute;
+    display: none;
+    z-index: 10;
+    border: 2px solid #2563eb;
+    border-radius: 4px;
+    padding: 4px 6px;
+    background: #fff;
+    font-family: inherit;
+    line-height: 1.45;
+    resize: both;
+    min-width: 200px;
+    min-height: 44px;
+  }
 </style>
 </head>
 <body>
@@ -88,13 +119,16 @@ export const boardHtml = `<!doctype html>
   <input id="size" type="range" min="2" max="24" value="4" title="太さ">
   <button id="pen" class="tool active" title="ペン">&#9998; ペン</button>
   <button id="eraser" class="tool" title="消しゴム">&#9723; 消しゴム</button>
+  <button id="text" class="tool" title="テキスト($...$ でTeX数式)">T テキスト</button>
   <button id="share" class="tool" title="URLをコピー">URLをコピー</button>
   <span id="status"></span>
   <span id="users"></span>
 </div>
 <div id="stage">
   <canvas id="base"></canvas>
+  <div id="texlayer"></div>
   <canvas id="top"></canvas>
+  <textarea id="editor" placeholder="テキスト($...$ でTeX数式)&#10;Ctrl+Enterで確定 / Escで取消"></textarea>
 </div>
 <div id="pagebar">
   <span id="tabs" style="display:flex;gap:6px;"></span>
@@ -122,10 +156,16 @@ var drawing = null;      // 自分の描画中ストローク
 var pendingPts = [];     // 未送信の点
 var eraseIds = [];       // 未送信の消去ID
 var lastCursor = 0;
+var lastPt = null;       // 最後のポインタ位置(仮想座標)
+var editing = null;      // テキスト編集中の配置位置 {x, y}
+var itemEls = {};        // テキストアイテム id -> DOM要素
+var ERASE_R = 14;        // 消しゴム半径(仮想座標)
 
 var baseC = document.getElementById("base");
 var topC = document.getElementById("top");
 var stage = document.getElementById("stage");
+var texLayer = document.getElementById("texlayer");
+var editor = document.getElementById("editor");
 var view = { scale: 1, ox: 0, oy: 0, dpr: 1 };
 
 function newId() {
@@ -149,6 +189,7 @@ function layout() {
     oy: (r.height - H * scale) / 2,
     dpr: dpr
   };
+  texLayer.style.transform = "translate(" + view.ox + "px," + view.oy + "px) scale(" + view.scale + ")";
   redrawBase();
 }
 
@@ -209,6 +250,13 @@ function drawTop() {
   }
   if (drawing) drawStroke(ctx, drawing);
   ctx.restore();
+  if (tool === "eraser" && lastPt) {
+    ctx.strokeStyle = "#6b7280";
+    ctx.lineWidth = 1.5 / view.scale;
+    ctx.beginPath();
+    ctx.arc(lastPt[0], lastPt[1], ERASE_R, 0, Math.PI * 2);
+    ctx.stroke();
+  }
   // 他ユーザーのマーカー
   var now = Date.now();
   for (var uid in cursors) {
@@ -271,6 +319,7 @@ function handle(m) {
       if (m.pageId === cur) {
         strokes = m.strokes;
         redrawBase();
+        renderItems();
       }
       break;
     case "pages":
@@ -291,12 +340,14 @@ function handle(m) {
       if (m.pageId === cur) {
         strokes.push(m.stroke);
         redrawBase();
+        renderItems();
       }
       break;
     case "erase":
       if (m.pageId === cur) {
         strokes = strokes.filter(function (s) { return m.ids.indexOf(s.id) < 0; });
         redrawBase();
+        renderItems();
       }
       break;
     case "cursor":
@@ -331,40 +382,109 @@ function distToSeg(p, a, b) {
   return Math.sqrt(px * px + py * py);
 }
 
-function eraseAt(pt) {
-  var radius = 14;
-  var removed = [];
-  strokes = strokes.filter(function (s) {
-    for (var i = 0; i < s.pts.length; i++) {
-      var a = s.pts[i], b = s.pts[Math.min(i + 1, s.pts.length - 1)];
-      if (distToSeg(pt, a, b) < radius + s.size / 2) {
-        removed.push(s.id);
-        return false;
+// 消しゴム円の近くのセグメントを細分化したうえで、円内の点を除いた
+// 連続区間(断片)に分割する。1点も消えなければ null(変更なし)。
+function splitStroke(s, pt) {
+  var r = ERASE_R + s.size / 2;
+  var pts = [];
+  for (var i = 0; i < s.pts.length; i++) {
+    pts.push(s.pts[i]);
+    if (i + 1 < s.pts.length && distToSeg(pt, s.pts[i], s.pts[i + 1]) < r) {
+      var a = s.pts[i], b = s.pts[i + 1];
+      var dx = b[0] - a[0], dy = b[1] - a[1];
+      var n = Math.floor(Math.sqrt(dx * dx + dy * dy) / (r / 3));
+      for (var k = 1; k <= n; k++) {
+        pts.push([
+          Math.round((a[0] + dx * k / (n + 1)) * 10) / 10,
+          Math.round((a[1] + dy * k / (n + 1)) * 10) / 10
+        ]);
       }
     }
-    return true;
-  });
-  if (removed.length > 0) {
-    eraseIds = eraseIds.concat(removed);
+  }
+  var runs = [], run = [], erased = 0;
+  for (var j = 0; j < pts.length; j++) {
+    var ex = pts[j][0] - pt[0], ey = pts[j][1] - pt[1];
+    if (ex * ex + ey * ey < r * r) {
+      erased++;
+      if (run.length > 1) runs.push(run);
+      run = [];
+    } else {
+      run.push(pts[j]);
+    }
+  }
+  if (erased === 0) return null;
+  if (run.length > 1) runs.push(run);
+  return runs;
+}
+
+function textHit(s, pt) {
+  var el = itemEls[s.id];
+  var w = el ? el.offsetWidth : 100;
+  var h = el ? el.offsetHeight : s.size * 1.5;
+  return pt[0] >= s.x - ERASE_R && pt[0] <= s.x + w + ERASE_R &&
+    pt[1] >= s.y - ERASE_R && pt[1] <= s.y + h + ERASE_R;
+}
+
+function eraseAt(pt) {
+  var changed = false;
+  var kept = [];
+  for (var i = 0; i < strokes.length; i++) {
+    var s = strokes[i];
+    if (s.kind === "text") {
+      // テキスト・数式は部分消去せず、触れたら丸ごと消す
+      if (textHit(s, pt)) {
+        eraseIds.push(s.id);
+        changed = true;
+      } else {
+        kept.push(s);
+      }
+      continue;
+    }
+    var hit = false;
+    for (var j = 0; j < s.pts.length; j++) {
+      var a = s.pts[j], b = s.pts[Math.min(j + 1, s.pts.length - 1)];
+      if (distToSeg(pt, a, b) < ERASE_R + s.size / 2) { hit = true; break; }
+    }
+    if (!hit) { kept.push(s); continue; }
+    var runs = splitStroke(s, pt);
+    if (runs === null) { kept.push(s); continue; }
+    changed = true;
+    eraseIds.push(s.id);
+    for (var k = 0; k < runs.length; k++) {
+      var frag = { id: newId(), color: s.color, size: s.size, pts: runs[k], t: s.t };
+      kept.push(frag);
+      send({ type: "stroke:end", pageId: cur, stroke: frag });
+    }
+  }
+  if (changed) {
+    strokes = kept;
     redrawBase();
+    renderItems();
   }
 }
 
 topC.addEventListener("pointerdown", function (e) {
   if (!connected || !cur) return;
-  topC.setPointerCapture(e.pointerId);
+  if (editing) commitEditor();
   var pt = toVirtual(e);
+  if (tool === "text") {
+    e.preventDefault();
+    openEditor(pt);
+    return;
+  }
+  topC.setPointerCapture(e.pointerId);
   if (tool === "pen") {
     drawing = { id: newId(), color: penColor, size: penSize, pts: [pt], t: Date.now() };
     send({ type: "stroke:start", pageId: cur,
       stroke: { id: drawing.id, color: penColor, size: penSize }, pt: pt });
-  } else {
+  } else if (tool === "eraser") {
     eraseAt(pt);
   }
 });
 
 topC.addEventListener("pointermove", function (e) {
   var pt = toVirtual(e);
+  lastPt = pt;
   var now = Date.now();
   if (now - lastCursor > 80 && connected && cur) {
     lastCursor = now;
@@ -390,6 +510,107 @@ function finishStroke() {
 
 topC.addEventListener("pointerup", finishStroke);
 topC.addEventListener("pointercancel", function () { drawing = null; });
+topC.addEventListener("pointerleave", function () { lastPt = null; });
+
+/* ---------- テキスト・TeX数式 ---------- */
+function textSize() {
+  return Math.max(14, penSize * 3);
+}
+
+function mathify(el) {
+  if (el.dataset.math === "1" || !window.renderMathInElement) return;
+  try {
+    renderMathInElement(el, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "$", right: "$", display: false }
+      ],
+      throwOnError: false
+    });
+    el.dataset.math = "1";
+  } catch (err) { /* KaTeX 失敗時はプレーンテキストのまま */ }
+}
+
+function katexLoaded() {
+  for (var id in itemEls) mathify(itemEls[id]);
+}
+
+function renderItems() {
+  var wanted = {};
+  for (var i = 0; i < strokes.length; i++) {
+    var s = strokes[i];
+    if (s.kind !== "text") continue;
+    wanted[s.id] = true;
+    if (!itemEls[s.id]) {
+      var el = document.createElement("div");
+      el.className = "textitem";
+      el.style.left = s.x + "px";
+      el.style.top = s.y + "px";
+      el.style.color = s.color;
+      el.style.fontSize = s.size + "px";
+      el.textContent = s.text;
+      texLayer.appendChild(el);
+      itemEls[s.id] = el;
+      mathify(el);
+    }
+  }
+  for (var id in itemEls) {
+    if (!wanted[id]) {
+      itemEls[id].remove();
+      delete itemEls[id];
+    }
+  }
+}
+
+function addTextItem(pt, text) {
+  var item = {
+    id: newId(), kind: "text", x: pt[0], y: pt[1],
+    text: text, color: penColor, size: textSize(), t: Date.now()
+  };
+  strokes.push(item);
+  renderItems();
+  send({ type: "stroke:end", pageId: cur, stroke: item });
+}
+
+function openEditor(pt) {
+  editing = { x: pt[0], y: pt[1] };
+  editor.style.left = (view.ox + pt[0] * view.scale) + "px";
+  editor.style.top = (view.oy + pt[1] * view.scale) + "px";
+  editor.style.fontSize = (textSize() * view.scale) + "px";
+  editor.style.color = penColor;
+  editor.value = "";
+  editor.style.display = "block";
+  setTimeout(function () { editor.focus(); }, 0);
+}
+
+function commitEditor() {
+  if (!editing) return;
+  var pos = editing;
+  var text = editor.value.trimEnd();
+  editing = null;
+  editor.style.display = "none";
+  if (text.length > 0) addTextItem([pos.x, pos.y], text);
+}
+
+editor.addEventListener("blur", commitEditor);
+editor.addEventListener("keydown", function (e) {
+  e.stopPropagation();
+  if (e.key === "Escape") {
+    editing = null;
+    editor.style.display = "none";
+  } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+    commitEditor();
+  }
+});
+
+// エディタ外での貼り付けはテキストアイテムとして配置
+document.addEventListener("paste", function (e) {
+  if (editing || !connected || !cur) return;
+  var text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+  if (!text || !text.trim()) return;
+  e.preventDefault();
+  addTextItem(lastPt || [W / 2 - 200, H / 2 - 50], text.trimEnd());
+});
 
 // 点と消去IDをまとめて送る(メッセージ数の節約)
 setInterval(flushPending, 40);
@@ -424,9 +645,11 @@ function renderTabs() {
 function switchPage(id) {
   if (id === cur) return;
   finishStroke();
+  if (editing) commitEditor();
   cur = id;
   strokes = [];
   redrawBase();
+  renderItems();
   renderTabs();
   send({ type: "load", pageId: cur });
 }
@@ -464,9 +687,12 @@ PEN_COLORS.forEach(function (c, i) {
 function updateToolButtons() {
   document.getElementById("pen").classList.toggle("active", tool === "pen");
   document.getElementById("eraser").classList.toggle("active", tool === "eraser");
+  document.getElementById("text").classList.toggle("active", tool === "text");
+  topC.style.cursor = tool === "text" ? "text" : (tool === "eraser" ? "none" : "crosshair");
 }
 document.getElementById("pen").onclick = function () { tool = "pen"; updateToolButtons(); };
 document.getElementById("eraser").onclick = function () { tool = "eraser"; updateToolButtons(); };
+document.getElementById("text").onclick = function () { tool = "text"; updateToolButtons(); };
 document.getElementById("size").oninput = function (e) { penSize = Number(e.target.value); };
 document.getElementById("addpage").onclick = function () { send({ type: "page:add" }); };
 document.getElementById("share").onclick = function () {
