@@ -1,0 +1,3 @@
+# Local-only Worker secrets for `wrangler dev`.
+# Do not commit real secrets. Add them with `npx wrangler secret put NAME`
+# or through GitHub Secrets / Doppler for deployed environments.
