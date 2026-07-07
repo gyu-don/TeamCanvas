@@ -94,7 +94,9 @@ export class BoardRoom implements DurableObject {
         break;
       }
       case "stroke:start":
-      case "stroke:points": {
+      case "stroke:points":
+      // text:update はドラッグ中のライブ反映用。保存はドロップ時の stroke:end で行う
+      case "text:update": {
         this.broadcast({ ...m, from: user.id }, ws);
         break;
       }

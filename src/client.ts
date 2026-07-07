@@ -96,6 +96,17 @@ export const boardHtml = `<!doctype html>
     max-width: 900px;
     line-height: 1.45;
   }
+  /* テキストツール選択中は移動・リサイズ可能なことを示す */
+  body.texttool .textitem { outline: 1px dashed #93c5fd; outline-offset: 2px; }
+  body.texttool .textitem::after {
+    content: "";
+    position: absolute;
+    right: -6px; bottom: -6px;
+    width: 10px; height: 10px;
+    background: #2563eb;
+    border: 2px solid #fff;
+    border-radius: 2px;
+  }
   #editor {
     position: absolute;
     display: none;
@@ -119,7 +130,7 @@ export const boardHtml = `<!doctype html>
   <input id="size" type="range" min="2" max="24" value="4" title="太さ">
   <button id="pen" class="tool active" title="ペン">&#9998; ペン</button>
   <button id="eraser" class="tool" title="消しゴム">&#9723; 消しゴム</button>
-  <button id="text" class="tool" title="テキスト($...$ でTeX数式)。既存テキストをクリックで編集">T テキスト</button>
+  <button id="text" class="tool" title="テキスト($...$ でTeX数式)。クリックで編集 / ドラッグで移動 / 右下角でサイズ変更">T テキスト</button>
   <button id="share" class="tool" title="URLをコピー">URLをコピー</button>
   <span id="status"></span>
   <span id="users"></span>
@@ -159,6 +170,9 @@ var lastCursor = 0;
 var lastPt = null;       // 最後のポインタ位置(仮想座標)
 var editing = null;      // テキスト編集中 {x, y, item} (item は再編集対象、新規は null)
 var itemEls = {};        // テキストアイテム id -> DOM要素
+var textDrag = null;     // テキストのドラッグ中 {item, mode, start, origX, origY, origSize}
+var lastTextUpd = 0;     // text:update の送信スロットル
+var HANDLE = 16;         // リサイズハンドルの判定幅(仮想座標)
 var ERASE_R = 14;        // 消しゴム半径(仮想座標)
 
 var baseC = document.getElementById("base");
@@ -344,6 +358,23 @@ function handle(m) {
         renderItems();
       }
       break;
+    case "text:update":
+      if (m.pageId === cur) {
+        for (var ti = 0; ti < strokes.length; ti++) {
+          if (strokes[ti].id === m.id && strokes[ti].kind === "text") {
+            var tv = strokes[ti];
+            tv.x = m.x; tv.y = m.y; tv.size = m.size;
+            var tel = itemEls[m.id];
+            if (tel) {
+              tel.style.left = m.x + "px";
+              tel.style.top = m.y + "px";
+              tel.style.fontSize = m.size + "px";
+            }
+            break;
+          }
+        }
+      }
+      break;
     case "erase":
       if (m.pageId === cur) {
         strokes = strokes.filter(function (s) { return m.ids.indexOf(s.id) < 0; });
@@ -470,7 +501,19 @@ topC.addEventListener("pointerdown", function (e) {
   var pt = toVirtual(e);
   if (tool === "text") {
     e.preventDefault();
-    openEditor(pt, findTextAt(pt));
+    var hi = textHitInfo(pt);
+    if (!hi) {
+      openEditor(pt, null);
+      return;
+    }
+    // ドラッグで移動/リサイズ。動かさず離したらクリック=編集(pointerupで判定)
+    topC.setPointerCapture(e.pointerId);
+    textDrag = {
+      item: hi.item,
+      mode: hi.corner ? "resize" : "press",
+      start: pt,
+      origX: hi.item.x, origY: hi.item.y, origSize: hi.item.size
+    };
     return;
   }
   topC.setPointerCapture(e.pointerId);
@@ -491,14 +534,62 @@ topC.addEventListener("pointermove", function (e) {
     lastCursor = now;
     send({ type: "cursor", pageId: cur, x: pt[0], y: pt[1] });
   }
-  if (e.buttons === 0) return;
-  if (tool === "pen" && drawing) {
+  if (e.buttons === 0) {
+    if (tool === "text") {
+      var hov = textHitInfo(pt);
+      topC.style.cursor = hov ? (hov.corner ? "nwse-resize" : "move") : "text";
+    }
+    return;
+  }
+  if (tool === "text" && textDrag) {
+    dragText(pt);
+  } else if (tool === "pen" && drawing) {
     drawing.pts.push(pt);
     pendingPts.push(pt);
   } else if (tool === "eraser") {
     eraseAt(pt);
   }
 });
+
+function dragText(pt) {
+  var d = textDrag, s = d.item;
+  var dx = pt[0] - d.start[0], dy = pt[1] - d.start[1];
+  if (d.mode === "press") {
+    if (dx * dx + dy * dy < 16) return; // 手ぶれはクリック扱いのまま
+    d.mode = "move";
+  }
+  if (d.mode === "move") {
+    s.x = Math.round((d.origX + dx) * 10) / 10;
+    s.y = Math.round((d.origY + dy) * 10) / 10;
+  } else {
+    // 左上を基点に、ポインタまでの距離の比でフォントサイズを拡縮
+    var d0 = Math.max(24, Math.hypot(d.start[0] - d.origX, d.start[1] - d.origY));
+    var d1 = Math.hypot(pt[0] - d.origX, pt[1] - d.origY);
+    s.size = Math.max(10, Math.min(200, Math.round(d.origSize * d1 / d0)));
+  }
+  var el = itemEls[s.id];
+  if (el) {
+    el.style.left = s.x + "px";
+    el.style.top = s.y + "px";
+    el.style.fontSize = s.size + "px";
+  }
+  var now = Date.now();
+  if (now - lastTextUpd > 60) {
+    lastTextUpd = now;
+    send({ type: "text:update", pageId: cur, id: s.id, x: s.x, y: s.y, size: s.size });
+  }
+}
+
+function endTextDrag() {
+  var d = textDrag;
+  textDrag = null;
+  if (d.mode === "press") {
+    openEditor(d.start, d.item);
+    return;
+  }
+  // 最終状態を保存(ドラッグ中は broadcast のみだったので、ここで確定)
+  send({ type: "stroke:end", pageId: cur, stroke: d.item });
+}
 
 function finishStroke() {
   if (!drawing) return;
@@ -509,8 +600,14 @@ function finishStroke() {
   redrawBase();
 }
 
-topC.addEventListener("pointerup", finishStroke);
-topC.addEventListener("pointercancel", function () { drawing = null; });
+topC.addEventListener("pointerup", function () {
+  if (textDrag) { endTextDrag(); return; }
+  finishStroke();
+});
+topC.addEventListener("pointercancel", function () {
+  if (textDrag) { endTextDrag(); return; }
+  drawing = null;
+});
 topC.addEventListener("pointerleave", function () { lastPt = null; });
 
 /* ---------- テキスト・TeX数式 ---------- */
@@ -577,14 +674,19 @@ function upsertText(item) {
   }
 }
 
-function findTextAt(pt) {
+// pt にあるテキストアイテムを手前優先で探す。corner は右下のリサイズハンドル上か
+function textHitInfo(pt) {
   for (var i = strokes.length - 1; i >= 0; i--) {
     var s = strokes[i];
     if (s.kind !== "text") continue;
     var el = itemEls[s.id];
     var w = el ? el.offsetWidth : 100;
     var h = el ? el.offsetHeight : s.size * 1.5;
-    if (pt[0] >= s.x && pt[0] <= s.x + w && pt[1] >= s.y && pt[1] <= s.y + h) return s;
+    var corner = pt[0] >= s.x + w - HANDLE && pt[0] <= s.x + w + 10 &&
+      pt[1] >= s.y + h - HANDLE && pt[1] <= s.y + h + 10;
+    var inside = pt[0] >= s.x && pt[0] <= s.x + w &&
+      pt[1] >= s.y && pt[1] <= s.y + h;
+    if (inside || corner) return { item: s, corner: corner };
   }
   return null;
 }
@@ -749,6 +851,7 @@ function updateToolButtons() {
   document.getElementById("pen").classList.toggle("active", tool === "pen");
   document.getElementById("eraser").classList.toggle("active", tool === "eraser");
   document.getElementById("text").classList.toggle("active", tool === "text");
+  document.body.classList.toggle("texttool", tool === "text");
   topC.style.cursor = tool === "text" ? "text" : (tool === "eraser" ? "none" : "crosshair");
 }
 document.getElementById("pen").onclick = function () { tool = "pen"; updateToolButtons(); };
