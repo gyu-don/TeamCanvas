@@ -60,8 +60,10 @@ export const boardHtml = `<!doctype html>
     border: 2px solid #1f2937;
   }
   #status { font-size: 12px; color: #9ca3af; }
-  #stage { position: relative; flex: 1; min-height: 0; }
-  #stage canvas { position: absolute; inset: 0; }
+  /* touch-action はタップされた要素自身に必要(bodyだけでは
+     iOS Safari のダブルタップズーム判定を止められない) */
+  #stage { position: relative; flex: 1; min-height: 0; touch-action: none; }
+  #stage canvas { position: absolute; inset: 0; touch-action: none; }
   #top { cursor: crosshair; }
   #pagebar {
     display: flex;
@@ -605,6 +607,7 @@ topC.addEventListener("pointerdown", function (e) {
     };
     return;
   }
+  e.preventDefault();
   topC.setPointerCapture(e.pointerId);
   activeId = e.pointerId;
   if (tool === "pen") {
@@ -737,6 +740,13 @@ topC.addEventListener("pointercancel", function (e) {
   flushEraseOp();
 });
 topC.addEventListener("pointerleave", function () { lastPt = null; });
+
+// iOS Safari は素早い連続タップをダブルタップ候補として扱い、2打目の
+// イベントを遅延・抑制することがある。touch イベント既定動作を止めて
+// タップジェスチャ判定と合成マウスイベント(dblclick等)を無効化する
+["touchstart", "touchmove", "touchend"].forEach(function (t) {
+  topC.addEventListener(t, function (e) { e.preventDefault(); }, { passive: false });
+});
 
 /* ---------- テキスト・TeX数式 ---------- */
 function textSize() {
