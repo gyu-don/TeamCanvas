@@ -577,7 +577,14 @@ function doUndo() {
 topC.addEventListener("pointerdown", function (e) {
   if (!connected || !cur) return;
   if (!isDrawPointer(e)) { e.preventDefault(); return; }
-  if (activeId !== null) return; // 操作中の2本目以降(掌・マルチタッチ)は無視
+  if (activeId !== null) {
+    if (e.pointerType !== "pen") return; // 操作中の2本目以降(掌・マルチタッチ)は無視
+    // pointerup の取りこぼし等でジェスチャが残っていたら確定してペンを優先
+    textDrag = null;
+    finishStroke();
+    flushEraseOp();
+    activeId = null;
+  }
   if (editing) commitEditor();
   var pt = toVirtual(e);
   if (tool === "text") {
@@ -709,6 +716,16 @@ topC.addEventListener("pointerup", function (e) {
   if (activeId !== null && e.pointerId !== activeId) return;
   activeId = null;
   if (textDrag) { endTextDrag(); return; }
+  // ペンを離した位置もストロークに含める。高速に描くと最後の pointermove から
+  // 離した点までの距離が大きく、これがないと終端が欠ける
+  if (drawing) {
+    var p = toVirtual(e);
+    var last = drawing.pts[drawing.pts.length - 1];
+    if (!last || p[0] !== last[0] || p[1] !== last[1]) {
+      drawing.pts.push(p);
+      pendingPts.push(p);
+    }
+  }
   finishStroke();
   flushEraseOp();
 });
