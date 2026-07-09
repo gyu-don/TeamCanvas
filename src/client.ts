@@ -179,6 +179,8 @@ var HANDLE = 16;         // リサイズハンドルの判定幅(仮想座標)
 // undo = added を消して removed を復元(同一IDは stroke:end の上書きで戻る)
 var undoStack = [];
 var eraseOp = null;      // 消しゴム1ジェスチャ分の undo 記録(pointerup で確定)
+var activeId = null;     // 操作中のポインタID。別ポインタ(掌など)のイベントは無視
+var penSeen = false;     // ペン入力を一度でも検出したら以後 touch を無視(パームリジェクション)
 var UNDO_MAX = 100;
 var ERASE_R = 14;        // 消しゴム半径(仮想座標)
 
@@ -405,6 +407,13 @@ function handle(m) {
 }
 
 /* ---------- 入力 ---------- */
+// 掌など無視すべきポインタなら false。Apple Pencil 等を一度でも検出したら
+// 以後のセッションでは touch(指・掌)を描画入力として受け付けない
+function isDrawPointer(e) {
+  if (e.pointerType === "pen") penSeen = true;
+  return !(penSeen && e.pointerType === "touch");
+}
+
 function toVirtual(e) {
   var r = topC.getBoundingClientRect();
   var x = (e.clientX - r.left - view.ox) / view.scale;
@@ -567,6 +576,8 @@ function doUndo() {
 
 topC.addEventListener("pointerdown", function (e) {
   if (!connected || !cur) return;
+  if (!isDrawPointer(e)) { e.preventDefault(); return; }
+  if (activeId !== null) return; // 操作中の2本目以降(掌・マルチタッチ)は無視
   if (editing) commitEditor();
   var pt = toVirtual(e);
   if (tool === "text") {
@@ -578,6 +589,7 @@ topC.addEventListener("pointerdown", function (e) {
     }
     // ドラッグで移動/リサイズ。動かさず離したらクリック=編集(pointerupで判定)
     topC.setPointerCapture(e.pointerId);
+    activeId = e.pointerId;
     textDrag = {
       item: hi.item,
       mode: hi.corner ? "resize" : "press",
@@ -587,6 +599,7 @@ topC.addEventListener("pointerdown", function (e) {
     return;
   }
   topC.setPointerCapture(e.pointerId);
+  activeId = e.pointerId;
   if (tool === "pen") {
     drawing = { id: newId(), color: penColor, size: penSize, pts: [pt], t: Date.now() };
     send({ type: "stroke:start", pageId: cur,
@@ -600,6 +613,8 @@ topC.addEventListener("pointerdown", function (e) {
 });
 
 topC.addEventListener("pointermove", function (e) {
+  if (!isDrawPointer(e)) return;
+  if (activeId !== null && e.pointerId !== activeId) return;
   var pt = toVirtual(e);
   lastPt = pt;
   var now = Date.now();
@@ -617,8 +632,18 @@ topC.addEventListener("pointermove", function (e) {
   if (tool === "text" && textDrag) {
     dragText(pt);
   } else if (tool === "pen" && drawing) {
-    drawing.pts.push(pt);
-    pendingPts.push(pt);
+    // pointermove は描画フレーム毎に間引かれるため、高速に描くと点が疎になる。
+    // getCoalescedEvents でセンサーのサンプル全点(Apple Pencil は 240Hz)を取る
+    var evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+    if (evs.length === 0) evs = [e];
+    var last = drawing.pts[drawing.pts.length - 1];
+    for (var i = 0; i < evs.length; i++) {
+      var p = toVirtual(evs[i]);
+      if (last && p[0] === last[0] && p[1] === last[1]) continue;
+      drawing.pts.push(p);
+      pendingPts.push(p);
+      last = p;
+    }
   } else if (tool === "eraser") {
     eraseAt(pt);
   }
@@ -680,12 +705,16 @@ function finishStroke() {
   redrawBase();
 }
 
-topC.addEventListener("pointerup", function () {
+topC.addEventListener("pointerup", function (e) {
+  if (activeId !== null && e.pointerId !== activeId) return;
+  activeId = null;
   if (textDrag) { endTextDrag(); return; }
   finishStroke();
   flushEraseOp();
 });
-topC.addEventListener("pointercancel", function () {
+topC.addEventListener("pointercancel", function (e) {
+  if (activeId !== null && e.pointerId !== activeId) return;
+  activeId = null;
   if (textDrag) { endTextDrag(); return; }
   drawing = null;
   flushEraseOp();
