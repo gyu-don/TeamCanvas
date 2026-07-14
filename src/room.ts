@@ -43,24 +43,65 @@ interface User {
   id: string;
   name: string;
   color: string;
+  // "viewer" は書き込み系メッセージをサーバー側で破棄する(認証フェーズ1のゲスト閲覧向け)。
+  // ヘッダが無い従来接続(認証未使用時・認証edit時のゲスト)は常に "editor"。
+  role: "editor" | "viewer";
 }
+
+const WRITE_MESSAGE_TYPES = new Set([
+  "stroke:start",
+  "stroke:points",
+  "stroke:end",
+  "text:update",
+  "erase",
+  "page:add",
+]);
 
 export class BoardRoom implements DurableObject {
   constructor(private state: DurableObjectState) {}
 
   async fetch(request: Request): Promise<Response> {
+    if (request.method === "DELETE") {
+      // 管理画面からのボード削除。DO へは binding 経由でしか到達できないため追加認証は不要。
+      for (const ws of this.state.getWebSockets()) {
+        try {
+          ws.close(1000, "board deleted");
+        } catch {
+          // 切断済みは無視
+        }
+      }
+      await this.state.storage.deleteAll();
+      return new Response(null, { status: 204 });
+    }
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected websocket", { status: 426 });
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
 
+    // Worker 側の認可結果をヘッダで受け取る。ID・名前が無ければ従来通り「ゲストN」を
+    // 採番する(モード0、および認証時の guest-editor / guest-viewer)。
+    // role は名前の有無と独立に判定する(閲覧のみゲストは名前なし + viewer)。
+    const headerId = request.headers.get("X-User-Id");
+    const headerNameRaw = request.headers.get("X-User-Name");
+    // Worker 側で URL エンコードして渡される(任意文字列をヘッダに安全に載せるため)
+    let headerName: string | null = null;
+    if (headerNameRaw) {
+      try {
+        headerName = decodeURIComponent(headerNameRaw);
+      } catch {
+        headerName = headerNameRaw;
+      }
+    }
+    const role: User["role"] =
+      request.headers.get("X-User-Role") === "viewer" ? "viewer" : "editor";
     const seq = ((await this.state.storage.get<number>("userSeq")) ?? 0) + 1;
     await this.state.storage.put("userSeq", seq);
     const user: User = {
-      id: crypto.randomUUID().slice(0, 8),
-      name: `ゲスト${seq}`,
+      id: headerId && headerName ? headerId : crypto.randomUUID().slice(0, 8),
+      name: headerId && headerName ? headerName : `ゲスト${seq}`,
       color: USER_COLORS[(seq - 1) % USER_COLORS.length],
+      role,
     };
     server.serializeAttachment(user);
     this.state.acceptWebSocket(server);
@@ -84,6 +125,10 @@ export class BoardRoom implements DurableObject {
       return;
     }
     const user = ws.deserializeAttachment() as User;
+    if (user.role === "viewer" && WRITE_MESSAGE_TYPES.has(m.type)) {
+      // 閲覧のみユーザーからの書き込み系メッセージはサーバー側で破棄する
+      return;
+    }
 
     switch (m.type) {
       case "load": {

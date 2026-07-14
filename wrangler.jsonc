@@ -19,5 +19,20 @@
       "tag": "v1",
       "new_sqlite_classes": ["BoardRoom"]
     }
-  ]
+  ],
+  // 認証(パスワード/招待制)を有効にする場合は、以下2つのコメントを外してください。
+  // 1. `npx wrangler d1 create teamcanvas` を実行し、表示された database_id を貼り付ける
+  // 2. デプロイ後、`/setup` にアクセスして最初の管理者アカウントを作成する
+  // (テーブルはランタイムで自動作成されるので、migrations の実行は不要です)
+  // 詳しくは README の「認証機能を有効にする」を参照してください。
+  // "d1_databases": [
+  //   {
+  //     "binding": "DB",
+  //     "database_name": "teamcanvas",
+  //     "database_id": "<wrangler d1 create の出力に表示される database_id>"
+  //   }
+  // ],
+  // "vars": {
+  //   "AUTH_MODE": "password"
+  // }
 }

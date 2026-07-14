@@ -60,6 +60,12 @@ export const boardHtml = `<!doctype html>
     border: 2px solid #1f2937;
   }
   #status { font-size: 12px; color: #9ca3af; }
+  /* 閲覧のみユーザー(認証フェーズ1のゲスト閲覧)はツールバー・ページ追加を隠す */
+  body.viewonly #toolbar .tool,
+  body.viewonly #toolbar #size,
+  body.viewonly #toolbar #colors,
+  body.viewonly #toolbar #undo,
+  body.viewonly #addpage { display: none; }
   /* touch-action はタップされた要素自身に必要(bodyだけでは
      iOS Safari のダブルタップズーム判定を止められない) */
   #stage { position: relative; flex: 1; min-height: 0; touch-action: none; }
@@ -164,6 +170,7 @@ var me = null;
 var ws = null;
 var connected = false;
 
+var viewOnly = false; // 認証フェーズ1: role=viewer の閲覧専用接続
 var tool = "pen";
 var penColor = PEN_COLORS[0];
 var penSize = 4;
@@ -330,6 +337,8 @@ function handle(m) {
   switch (m.type) {
     case "init":
       me = m.user;
+      viewOnly = me.role === "viewer";
+      document.body.classList.toggle("viewonly", viewOnly);
       pages = m.pages;
       users = {};
       m.users.forEach(function (u) { users[u.id] = u; });
@@ -546,6 +555,7 @@ function updateUndoUI() {
 }
 
 function doUndo() {
+  if (viewOnly) return;
   var op = undoStack.pop();
   if (!op) return;
   updateUndoUI();
@@ -577,7 +587,7 @@ function doUndo() {
 }
 
 topC.addEventListener("pointerdown", function (e) {
-  if (!connected || !cur) return;
+  if (!connected || !cur || viewOnly) return;
   if (!isDrawPointer(e)) { e.preventDefault(); return; }
   if (activeId !== null) {
     if (e.pointerType !== "pen") return; // 操作中の2本目以降(掌・マルチタッチ)は無視
@@ -909,7 +919,7 @@ editor.addEventListener("keydown", function (e) {
 
 // エディタ外での貼り付けはテキストアイテムとして配置
 document.addEventListener("paste", function (e) {
-  if (editing || !connected || !cur) return;
+  if (editing || !connected || !cur || viewOnly) return;
   var text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
   if (!text || !text.trim()) return;
   e.preventDefault();
