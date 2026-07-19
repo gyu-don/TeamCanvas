@@ -46,6 +46,7 @@ interface User {
   // "viewer" は書き込み系メッセージをサーバー側で破棄する(認証フェーズ1のゲスト閲覧向け)。
   // ヘッダが無い従来接続(認証未使用時・認証edit時のゲスト)は常に "editor"。
   role: "editor" | "viewer";
+  pageId?: string;
 }
 
 // viewer に許可する読み取り系メッセージ。新しいメッセージ種別はデフォルトで拒否される
@@ -126,7 +127,12 @@ export class BoardRoom implements DurableObject {
 
     switch (m.type) {
       case "load": {
-        const strokes = await this.loadStrokes(String(m.pageId));
+        const pageId = String(m.pageId);
+        // load はページ表示の合図なので、在席ページとして記録・通知する
+        user.pageId = pageId;
+        ws.serializeAttachment(user);
+        this.broadcast({ type: "presence", id: user.id, pageId }, ws);
+        const strokes = await this.loadStrokes(pageId);
         ws.send(
           JSON.stringify({ type: "pageData", pageId: m.pageId, strokes }),
         );
