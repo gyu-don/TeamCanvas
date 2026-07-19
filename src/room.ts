@@ -48,14 +48,8 @@ interface User {
   role: "editor" | "viewer";
 }
 
-const WRITE_MESSAGE_TYPES = new Set([
-  "stroke:start",
-  "stroke:points",
-  "stroke:end",
-  "text:update",
-  "erase",
-  "page:add",
-]);
+// viewer に許可する読み取り系メッセージ。新しいメッセージ種別はデフォルトで拒否される
+const VIEWER_ALLOWED_MESSAGE_TYPES = new Set(["load", "cursor"]);
 
 export class BoardRoom implements DurableObject {
   constructor(private state: DurableObjectState) {}
@@ -125,8 +119,8 @@ export class BoardRoom implements DurableObject {
       return;
     }
     const user = ws.deserializeAttachment() as User;
-    if (user.role === "viewer" && WRITE_MESSAGE_TYPES.has(m.type)) {
-      // 閲覧のみユーザーからの書き込み系メッセージはサーバー側で破棄する
+    if (user.role === "viewer" && !VIEWER_ALLOWED_MESSAGE_TYPES.has(m.type)) {
+      // 閲覧のみユーザーからは読み取り系以外のメッセージをサーバー側で破棄する
       return;
     }
 
