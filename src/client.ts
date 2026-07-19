@@ -85,6 +85,14 @@ export const boardHtml = `<!doctype html>
     font-size: 13px;
   }
   .tab.active { background: #2563eb; color: #fff; }
+  /* タブ上の他ユーザー在席ドット */
+  .tab .pdots { display: inline-flex; gap: 2px; margin-left: 5px; vertical-align: middle; }
+  .tab .pdot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+    border: 1px solid #1f2937;
+  }
   #texlayer {
     position: absolute;
     left: 0; top: 0;
@@ -334,6 +342,7 @@ function handle(m) {
       users = {};
       m.users.forEach(function (u) { users[u.id] = u; });
       if (!cur || pages.indexOf(cur) < 0) cur = pages[0];
+      if (users[me.id]) users[me.id].pageId = cur;
       strokes = [];
       send({ type: "load", pageId: cur });
       renderTabs();
@@ -396,14 +405,21 @@ function handle(m) {
     case "cursor":
       cursors[m.id] = { x: m.x, y: m.y, pageId: m.pageId, name: m.name, color: m.color, t: Date.now() };
       break;
+    case "presence":
+      if (users[m.id]) users[m.id].pageId = m.pageId;
+      renderUsers();
+      renderTabs();
+      break;
     case "join":
       users[m.user.id] = m.user;
       renderUsers();
+      renderTabs();
       break;
     case "leave":
       delete users[m.id];
       delete cursors[m.id];
       renderUsers();
+      renderTabs();
       break;
   }
 }
@@ -941,6 +957,22 @@ function renderTabs() {
     var b = document.createElement("button");
     b.className = "tab" + (id === cur ? " active" : "");
     b.textContent = String(i + 1);
+    // このページを見ている他ユーザーを色ドットで示す
+    var dots = null;
+    Object.keys(users).forEach(function (uid) {
+      var u = users[uid];
+      if (u.pageId !== id || (me && uid === me.id)) return;
+      if (!dots) {
+        dots = document.createElement("span");
+        dots.className = "pdots";
+      }
+      var p = document.createElement("span");
+      p.className = "pdot";
+      p.style.background = u.color;
+      p.title = u.name;
+      dots.appendChild(p);
+    });
+    if (dots) b.appendChild(dots);
     b.onclick = function () { switchPage(id); };
     el.appendChild(b);
   });
@@ -951,6 +983,7 @@ function switchPage(id) {
   finishStroke();
   if (editing) commitEditor();
   cur = id;
+  if (me && users[me.id]) users[me.id].pageId = cur;
   strokes = [];
   redrawBase();
   renderItems();
@@ -966,7 +999,9 @@ function renderUsers() {
     var d = document.createElement("span");
     d.className = "userdot";
     d.style.background = u.color;
-    d.title = u.name + (me && id === me.id ? "(自分)" : "");
+    var pi = u.pageId ? pages.indexOf(u.pageId) : -1;
+    d.title = u.name + (me && id === me.id ? "(自分)" : "") +
+      (pi >= 0 ? " - ページ" + (pi + 1) : "");
     d.textContent = u.name.replace("ゲスト", "");
     el.appendChild(d);
   });

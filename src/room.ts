@@ -43,6 +43,7 @@ interface User {
   id: string;
   name: string;
   color: string;
+  pageId?: string;
 }
 
 export class BoardRoom implements DurableObject {
@@ -87,7 +88,12 @@ export class BoardRoom implements DurableObject {
 
     switch (m.type) {
       case "load": {
-        const strokes = await this.loadStrokes(String(m.pageId));
+        const pageId = String(m.pageId);
+        // load はページ表示の合図なので、在席ページとして記録・通知する
+        user.pageId = pageId;
+        ws.serializeAttachment(user);
+        this.broadcast({ type: "presence", id: user.id, pageId }, ws);
+        const strokes = await this.loadStrokes(pageId);
         ws.send(
           JSON.stringify({ type: "pageData", pageId: m.pageId, strokes }),
         );
