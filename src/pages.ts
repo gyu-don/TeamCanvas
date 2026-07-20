@@ -1,6 +1,15 @@
 // 認証・管理画面まわりの素朴なサーバーレンダリング HTML。
 // client.ts のトーン(system-ui, ダークな #1f2937 のバー, 最小限の装飾)に合わせる。
-import type { DbBoard, DbInvite, DbUser, GuestAccess } from "./db";
+import {
+  normalizeVisibility,
+  type BoardVisibility,
+  type DbBoard,
+  type DbBoardMemberWithUser,
+  type DbInvite,
+  type DbMemberBoard,
+  type DbUser,
+  type GuestAccess,
+} from "./db";
 
 export function escapeHtml(s: string): string {
   return s
@@ -14,6 +23,22 @@ export function escapeHtml(s: string): string {
 function fmtDate(ms: number): string {
   return new Date(ms).toLocaleString("ja-JP");
 }
+
+const VISIBILITY_LABELS: Record<BoardVisibility, string> = {
+  link: "リンク共有",
+  tenant: "ログインユーザー",
+  restricted: "メンバーのみ",
+};
+
+function visibilityBadge(v: string | null): string {
+  return `<span class="badge">${VISIBILITY_LABELS[normalizeVisibility(v)]}</span>`;
+}
+
+const MEMBER_ROLE_LABELS: Record<string, string> = {
+  viewer: "閲覧",
+  editor: "編集",
+  owner: "オーナー",
+};
 
 const STYLE = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -240,24 +265,81 @@ export function invitePage(opts: { token: string; error?: string }): string {
   });
 }
 
+/* ---------- 招待リンクの表(管理画面・ホームで共用) ---------- */
+
+function inviteTable(
+  invites: DbInvite[],
+  origin: string,
+  deleteAction: (token: string) => string,
+): string {
+  const now = Date.now();
+  const rows = invites
+    .map((iv) => {
+      const url = `${origin}/invite/${iv.token}`;
+      const expired = iv.expires_at <= now;
+      const usedUp = iv.use_count >= iv.max_uses;
+      const status = usedUp ? "使用済み" : expired ? "期限切れ" : "有効";
+      return `
+        <tr>
+          <td><code style="word-break:break-all;">${escapeHtml(url)}</code></td>
+          <td class="muted">${escapeHtml(iv.email ?? "")}</td>
+          <td class="muted">${iv.use_count}/${iv.max_uses}</td>
+          <td class="muted">${fmtDate(iv.expires_at)}</td>
+          <td>${status}</td>
+          <td>
+            <form class="inline" method="post" action="${deleteAction(iv.token)}">
+              <button type="submit" class="danger" style="padding:4px 10px;font-size:13px;">失効</button>
+            </form>
+          </td>
+        </tr>`;
+    })
+    .join("");
+  return `<table>
+    <tr><th>URL</th><th>メモ</th><th>使用</th><th>有効期限</th><th>状態</th><th></th></tr>
+    ${rows}
+  </table>`;
+}
+
 /* ---------- / (home) ---------- */
 
 export function homePage(opts: {
   user: DbUser;
   boards: DbBoard[];
+  memberBoards: DbMemberBoard[];
+  invites: DbInvite[];
+  canInvite: boolean;
+  origin: string;
+  error?: string;
 }): string {
   const rows = opts.boards
     .map(
       (b) => `
         <tr>
           <td><a href="/b/${escapeHtml(b.id)}">${escapeHtml(b.id)}</a></td>
+          <td>${visibilityBadge(b.visibility)}</td>
           <td class="muted">${fmtDate(b.created_at)}</td>
           <td class="muted">${fmtDate(b.last_active)}</td>
-          <td>
+          <td class="actions">
+            <a class="btn secondary" style="padding:4px 10px;font-size:13px;" href="/b/${encodeURIComponent(b.id)}/settings">共有設定</a>
             <form class="inline" method="post" action="/boards/${encodeURIComponent(b.id)}/delete" onsubmit="return confirm('このボードを削除しますか?元に戻せません。');">
               <button type="submit" class="danger" style="padding:4px 10px;font-size:13px;">削除</button>
             </form>
           </td>
+        </tr>`,
+    )
+    .join("");
+  const memberRows = opts.memberBoards
+    .map(
+      (b) => `
+        <tr>
+          <td><a href="/b/${escapeHtml(b.id)}">${escapeHtml(b.id)}</a></td>
+          <td><span class="badge">${MEMBER_ROLE_LABELS[b.member_role] ?? escapeHtml(b.member_role)}</span></td>
+          <td class="muted">${fmtDate(b.last_active)}</td>
+          <td>${
+            b.member_role === "owner"
+              ? `<a class="btn secondary" style="padding:4px 10px;font-size:13px;" href="/b/${encodeURIComponent(b.id)}/settings">共有設定</a>`
+              : ""
+          }</td>
         </tr>`,
     )
     .join("");
@@ -266,6 +348,7 @@ export function homePage(opts: {
     headerUser: { name: opts.user.name, role: opts.user.role },
     body: `
       <h1>マイボード</h1>
+      ${opts.error ? `<div class="error" style="margin-bottom:12px;">${escapeHtml(opts.error)}</div>` : ""}
       <div class="card">
         <form method="post" action="/boards/new">
           <button type="submit">新規ボードを作成</button>
@@ -276,8 +359,171 @@ export function homePage(opts: {
           opts.boards.length === 0
             ? '<p class="muted">まだボードがありません。</p>'
             : `<table>
-                 <tr><th>ボードID</th><th>作成日</th><th>最終更新</th><th></th></tr>
+                 <tr><th>ボードID</th><th>公開範囲</th><th>作成日</th><th>最終更新</th><th></th></tr>
                  ${rows}
+               </table>`
+        }
+      </div>
+      ${
+        opts.memberBoards.length > 0
+          ? `<h2>参加中のボード</h2>
+             <div class="card">
+               <table>
+                 <tr><th>ボードID</th><th>役割</th><th>最終更新</th><th></th></tr>
+                 ${memberRows}
+               </table>
+             </div>`
+          : ""
+      }
+      ${
+        opts.canInvite
+          ? `<h2>招待リンク</h2>
+             <div class="card">
+               <form method="post" action="/me/invites/new">
+                 <div class="row">
+                   <div style="flex:1;min-width:160px;">
+                     <label for="email">メモ(メールアドレス等・任意)</label>
+                     <input type="text" id="email" name="email">
+                   </div>
+                   <div style="width:140px;">
+                     <label for="expires_days">有効期限(日)</label>
+                     <input type="number" id="expires_days" name="expires_days" value="7" min="1" max="30">
+                   </div>
+                   <div style="width:120px;">
+                     <label for="max_uses">利用可能回数</label>
+                     <input type="number" id="max_uses" name="max_uses" value="1" min="1" max="10">
+                   </div>
+                 </div>
+                 <div class="row" style="margin-top:14px;">
+                   <button type="submit">招待リンクを発行</button>
+                 </div>
+               </form>
+             </div>
+             <div class="card">
+               ${
+                 opts.invites.length === 0
+                   ? '<p class="muted">発行済みの招待リンクはありません。</p>'
+                   : inviteTable(opts.invites, opts.origin, (t) => `/me/invites/${escapeHtml(t)}/delete`)
+               }
+             </div>`
+          : ""
+      }
+    `,
+  });
+}
+
+/* ---------- /b/:id 403 ---------- */
+
+export function accessDeniedPage(user: DbUser | null): string {
+  return layout({
+    title: "アクセス権がありません",
+    headerUser: user ? { name: user.name, role: user.role } : null,
+    body: `
+      <h1>このボードにアクセスする権限がありません</h1>
+      <div class="card">
+        <p>このボードは「メンバーのみ」に設定されています。ボードのオーナーにメンバー追加を依頼してください。</p>
+        <p style="margin-top:12px;"><a href="/" class="btn">ホームへ</a></p>
+      </div>
+    `,
+  });
+}
+
+/* ---------- /b/:id/settings ---------- */
+
+export function boardSettingsPage(opts: {
+  user: DbUser;
+  board: DbBoard;
+  members: DbBoardMemberWithUser[];
+  creator: DbUser | null;
+  error?: string;
+  success?: string;
+}): string {
+  const vis = normalizeVisibility(opts.board.visibility);
+  const memberRows = opts.members
+    .map(
+      (m) => `
+        <tr>
+          <td>${escapeHtml(m.name)}</td>
+          <td class="muted">${escapeHtml(m.login_id)}</td>
+          <td>
+            <form class="inline row" method="post" action="/b/${encodeURIComponent(opts.board.id)}/settings/members/update" style="gap:6px;">
+              <input type="hidden" name="user_id" value="${escapeHtml(m.user_id)}">
+              <select name="role" style="width:auto;">
+                <option value="viewer" ${m.role === "viewer" ? "selected" : ""}>閲覧</option>
+                <option value="editor" ${m.role === "editor" ? "selected" : ""}>編集</option>
+                <option value="owner" ${m.role === "owner" ? "selected" : ""}>オーナー</option>
+              </select>
+              <button type="submit" class="secondary" style="padding:4px 10px;font-size:13px;">変更</button>
+            </form>
+          </td>
+          <td>
+            <form class="inline" method="post" action="/b/${encodeURIComponent(opts.board.id)}/settings/members/remove">
+              <input type="hidden" name="user_id" value="${escapeHtml(m.user_id)}">
+              <button type="submit" class="danger" style="padding:4px 10px;font-size:13px;">削除</button>
+            </form>
+          </td>
+        </tr>`,
+    )
+    .join("");
+  return layout({
+    title: `共有設定 - ${opts.board.id}`,
+    headerUser: { name: opts.user.name, role: opts.user.role },
+    body: `
+      <h1>ボード「${escapeHtml(opts.board.id)}」の共有設定</h1>
+      <p style="margin-bottom:16px;"><a href="/b/${encodeURIComponent(opts.board.id)}">← ボードへ戻る</a></p>
+      ${opts.error ? `<div class="error" style="margin-bottom:12px;">${escapeHtml(opts.error)}</div>` : ""}
+      ${opts.success ? `<div class="success" style="margin-bottom:12px;">${escapeHtml(opts.success)}</div>` : ""}
+
+      <h2>公開範囲</h2>
+      <div class="card">
+        <form method="post" action="/b/${encodeURIComponent(opts.board.id)}/settings/visibility">
+          <div class="row">
+            <label style="margin:0;"><input type="radio" name="visibility" value="link" ${vis === "link" ? "checked" : ""}> リンク共有(URL を知っているログインユーザーが編集可。未ログインはインスタンスのゲストアクセス設定に従う)</label>
+          </div>
+          <div class="row">
+            <label style="margin:0;"><input type="radio" name="visibility" value="tenant" ${vis === "tenant" ? "checked" : ""}> ログインユーザー(このインスタンスのログインユーザーのみ編集可。未ログインは不可)</label>
+          </div>
+          <div class="row">
+            <label style="margin:0;"><input type="radio" name="visibility" value="restricted" ${vis === "restricted" ? "checked" : ""}> メンバーのみ(下のメンバーに登録した人だけがアクセス可)</label>
+          </div>
+          <div class="row" style="margin-top:14px;">
+            <button type="submit">保存</button>
+          </div>
+        </form>
+      </div>
+
+      <h2>メンバー</h2>
+      <div class="card">
+        <p class="muted" style="margin-bottom:10px;">
+          オーナー: ${opts.creator ? escapeHtml(opts.creator.name) : "(不明)"} / メンバーは公開範囲によらずここで指定した役割でアクセスできます。
+        </p>
+        <form method="post" action="/b/${encodeURIComponent(opts.board.id)}/settings/members/add">
+          <div class="row">
+            <div style="flex:1;min-width:160px;">
+              <label for="login_id">ログインID</label>
+              <input type="text" id="login_id" name="login_id" required autocomplete="off">
+            </div>
+            <div style="width:140px;">
+              <label for="role">役割</label>
+              <select id="role" name="role">
+                <option value="viewer">閲覧</option>
+                <option value="editor" selected>編集</option>
+                <option value="owner">オーナー</option>
+              </select>
+            </div>
+          </div>
+          <div class="row" style="margin-top:14px;">
+            <button type="submit">メンバーを追加</button>
+          </div>
+        </form>
+      </div>
+      <div class="card">
+        ${
+          opts.members.length === 0
+            ? '<p class="muted">メンバーはいません。</p>'
+            : `<table>
+                 <tr><th>表示名</th><th>ログインID</th><th>役割</th><th></th></tr>
+                 ${memberRows}
                </table>`
         }
       </div>
@@ -324,12 +570,12 @@ export function adminPage(opts: {
   users: DbUser[];
   invites: DbInvite[];
   guestAccess: GuestAccess;
+  maxBoardsPerUser: number;
+  memberInviteEnabled: boolean;
   origin: string;
   error?: string;
   success?: string;
 }): string {
-  const now = Date.now();
-
   const boardRows = opts.boards
     .map((b) => {
       const owner = opts.users.find((u) => u.id === b.creator_id);
@@ -337,9 +583,11 @@ export function adminPage(opts: {
         <tr>
           <td><a href="/b/${escapeHtml(b.id)}">${escapeHtml(b.id)}</a></td>
           <td>${owner ? escapeHtml(owner.name) : '<span class="muted">(ゲスト作成 / 不明)</span>'}</td>
+          <td>${visibilityBadge(b.visibility)}</td>
           <td class="muted">${fmtDate(b.created_at)}</td>
           <td class="muted">${fmtDate(b.last_active)}</td>
-          <td>
+          <td class="actions">
+            <a class="btn secondary" style="padding:4px 10px;font-size:13px;" href="/b/${encodeURIComponent(b.id)}/settings">共有設定</a>
             <form class="inline" method="post" action="/admin/boards/${encodeURIComponent(b.id)}/delete" onsubmit="return confirm('このボードを完全に削除しますか?元に戻せません。');">
               <button type="submit" class="danger" style="padding:4px 10px;font-size:13px;">削除</button>
             </form>
@@ -375,28 +623,6 @@ export function adminPage(opts: {
     })
     .join("");
 
-  const inviteRows = opts.invites
-    .map((iv) => {
-      const url = `${opts.origin}/invite/${iv.token}`;
-      const expired = iv.expires_at <= now;
-      const usedUp = iv.use_count >= iv.max_uses;
-      const status = usedUp ? "使用済み" : expired ? "期限切れ" : "有効";
-      return `
-        <tr>
-          <td><code style="word-break:break-all;">${escapeHtml(url)}</code></td>
-          <td class="muted">${escapeHtml(iv.email ?? "")}</td>
-          <td class="muted">${iv.use_count}/${iv.max_uses}</td>
-          <td class="muted">${fmtDate(iv.expires_at)}</td>
-          <td>${status}</td>
-          <td>
-            <form class="inline" method="post" action="/admin/invites/${escapeHtml(iv.token)}/delete">
-              <button type="submit" class="danger" style="padding:4px 10px;font-size:13px;">失効</button>
-            </form>
-          </td>
-        </tr>`;
-    })
-    .join("");
-
   return layout({
     title: "管理画面",
     wide: true,
@@ -422,6 +648,25 @@ export function adminPage(opts: {
             <button type="submit">保存</button>
           </div>
         </form>
+      </div>
+
+      <h2>クォータ・招待ポリシー</h2>
+      <div class="card">
+        <form method="post" action="/admin/settings/policies">
+          <div class="row">
+            <div style="width:240px;">
+              <label for="max_boards_per_user">ユーザーあたりボード数上限(0 = 無制限)</label>
+              <input type="number" id="max_boards_per_user" name="max_boards_per_user" value="${opts.maxBoardsPerUser}" min="0" max="10000">
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <label style="margin:0;"><input type="checkbox" name="member_invite" value="1" ${opts.memberInviteEnabled ? "checked" : ""}> member にも招待リンクの発行を許可する(ホーム画面に発行欄が表示されます)</label>
+          </div>
+          <div class="row" style="margin-top:14px;">
+            <button type="submit">保存</button>
+          </div>
+        </form>
+        <p class="muted" style="margin-top:10px;">上限は member の新規作成時に適用されます(admin には適用されません)。</p>
       </div>
 
       <h2>招待リンク</h2>
@@ -450,10 +695,7 @@ export function adminPage(opts: {
         ${
           opts.invites.length === 0
             ? '<p class="muted">発行済みの招待リンクはありません。</p>'
-            : `<table>
-                 <tr><th>URL</th><th>メモ</th><th>使用</th><th>有効期限</th><th>状態</th><th></th></tr>
-                 ${inviteRows}
-               </table>`
+            : inviteTable(opts.invites, opts.origin, (t) => `/admin/invites/${escapeHtml(t)}/delete`)
         }
       </div>
 
@@ -475,7 +717,7 @@ export function adminPage(opts: {
           opts.boards.length === 0
             ? '<p class="muted">ボードがありません。</p>'
             : `<table>
-                 <tr><th>ボードID</th><th>作成者</th><th>作成日</th><th>最終更新</th><th></th></tr>
+                 <tr><th>ボードID</th><th>作成者</th><th>公開範囲</th><th>作成日</th><th>最終更新</th><th></th></tr>
                  ${boardRows}
                </table>`
         }

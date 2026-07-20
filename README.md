@@ -73,14 +73,38 @@ npx wrangler secret put SETUP_TOKEN
 
 | 操作 | 未ログイン(ゲスト) | member | admin |
 | --- | --- | --- | --- |
-| 既存ボードの閲覧・編集 | `guest_access` に従う | ○ | ○ |
-| ボードの新規作成 | × | ○ | ○ |
-| 自分が作成したボードの削除 | × | ○ | ○ |
-| 招待リンクの発行・ユーザー管理・全ボード削除 | × | × | ○(`/admin`) |
+| 既存ボードの閲覧・編集 | `guest_access` とボードの公開範囲に従う | ボードの公開範囲に従う | ○ |
+| ボードの新規作成 | × | ○(クォータ設定時は上限まで) | ○ |
+| 自分のボードの削除・共有設定 | × | ○(作成者・オーナー) | ○ |
+| 招待リンクの発行 | × | ×(設定で許可可能) | ○ |
+| ユーザー管理・全ボード削除・インスタンス設定 | × | × | ○(`/admin`) |
 
-- アカウント作成は管理者が発行する招待リンク(`/invite/<token>`)経由のみです
+- アカウント作成は招待リンク(`/invite/<token>`)経由のみです
 - パスワードリセット機能はありません。忘れた場合は管理者が再招待し、本人が新アカウントを作る運用です(自分のパスワード変更はログイン後に可能)
 - BAN されたユーザーのセッションは即時無効になります
+
+### ボードの公開範囲とメンバー(共有設定)
+
+各ボードには公開範囲(visibility)があり、ホーム画面・管理画面の「共有設定」から変更できます。変更できるのはボードの作成者・オーナー役割のメンバー・admin です。
+
+- `link`(リンク共有): URL を知っているログインユーザーが編集できます。未ログインの扱いはインスタンスの `guest_access` に従います
+- `tenant`(ログインユーザー): このインスタンスのログインユーザーのみ編集できます。未ログインはアクセス不可
+- `restricted`(メンバーのみ): 共有設定で追加したメンバーだけがアクセスできます
+
+メンバーはログインIDで追加し、役割を指定します。役割は公開範囲より優先されます。
+
+- `viewer`(閲覧): 閲覧のみ。描画・編集はサーバー側で拒否されます
+- `editor`(編集): 閲覧と編集
+- `owner`(オーナー): 編集に加えて、共有設定の変更とボードの削除
+
+新規ボードのデフォルト公開範囲は `guest_access` から決まります: `none` なら `tenant`、`view` / `edit` なら `link` です(認証フェーズ1以前に作られた既存ボードは `link` として扱われます)。
+
+### クォータとメンバー招待(/admin)
+
+管理画面の「クォータ・招待ポリシー」で以下を設定できます。
+
+- **ユーザーあたりボード数上限**: member の新規ボード作成数を制限します(0 = 無制限、デフォルト)。admin には適用されません
+- **member にも招待リンクの発行を許可する**(デフォルト off): 有効にすると member のホーム画面に招待リンクの発行欄が表示されます。member が発行する招待は有効期限 30 日以内・利用 10 回以内に制限されます。なお、ユーザーを削除するとそのユーザーが発行した招待リンクも失効します
 
 ### ゲストアクセス(guest_access)
 
@@ -105,6 +129,39 @@ npx wrangler d1 execute teamcanvas --remote --command "DELETE FROM users"
 ### SSO を使いたい場合
 
 Google Workspace 等の SSO が必要な場合は、Worker の前段に [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) を置くのが簡単です(このアプリ側の変更は不要)。
+
+## 悪用対策(Cloudflare 側の設定ガイド)
+
+アプリ層の認証が担うのは「説明責任・クォータ・BAN」までで、大量リクエストによる DoS への対策は Cloudflare 側の機能に任せる設計です。アプリに組み込み済みの対策は次の2つだけです。
+
+- WebSocket メッセージのレート制限(Durable Object 側): 1接続あたり毎秒 60 メッセージ(バースト 180)、ストレージ書き込みを伴う操作(描画確定・消去・ページ追加)はさらに毎秒 10(バースト 60)。通常の描画操作には影響せず、超過分は黙って破棄されます
+- ボード数クォータ(前節)
+
+以下は Cloudflare ダッシュボードでの追加設定の推奨例です(いずれもアプリ側の変更は不要)。Workers の `workers.dev` ドメインでは利用できない機能があるため、[カスタムドメイン](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)の利用を推奨します。
+
+### Rate Limiting(ログイン試行などの制限)
+
+[Rate limiting rules](https://developers.cloudflare.com/waf/rate-limiting-rules/)(無料プランでも1ルール利用可)で、認証系エンドポイントへの試行回数を制限します。推奨例:
+
+- 対象: `(http.request.uri.path in {"/login" "/setup"} and http.request.method eq "POST")` または URI path が `/invite/` で始まる POST
+- 条件: 同一 IP から 10 秒間に 5 リクエスト超
+- アクション: Block(または Managed Challenge)
+
+これによりパスワードの総当たりと招待トークンの探索を大幅に遅くできます。
+
+### Turnstile / Managed Challenge(bot 対策)
+
+コード変更なしで bot 対策を入れるには、[WAF カスタムルール](https://developers.cloudflare.com/waf/custom-rules/)で認証系パス(`/login`、`/setup`、`/invite/*`)に **Managed Challenge** アクションを適用します(内部的に [Turnstile](https://developers.cloudflare.com/turnstile/) と同じ challenge 基盤が使われます。ページへの widget 埋め込みは不要です)。
+
+- 対象例: `http.request.uri.path eq "/login" and http.request.method eq "POST"`
+- アクション: Managed Challenge
+
+より広範に守りたい場合は [Bot Fight Mode](https://developers.cloudflare.com/bots/get-started/free/)(無料)の有効化も検討してください。
+
+### その他
+
+- **WAF マネージドルール**: Free プランでも [Cloudflare Free Managed Ruleset](https://developers.cloudflare.com/waf/managed-rules/) が既定で適用されます
+- **アクセス元を組織内に限定したい場合**: 前段に Cloudflare Access(上記 SSO の節)を置けば、認証以前にネットワークレベルで遮断できます
 
 ## Commands
 

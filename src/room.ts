@@ -52,7 +52,47 @@ interface User {
 // viewer に許可する読み取り系メッセージ。新しいメッセージ種別はデフォルトで拒否される
 const VIEWER_ALLOWED_MESSAGE_TYPES = new Set(["load", "cursor"]);
 
+// フェーズ2: 接続ごとの WS メッセージレート制限(トークンバケット)。
+// 正常なクライアントの送信レートは cursor 約13/s + stroke:points 25/s +
+// text:update 約17/s 程度なので、通常操作には余裕を持たせつつ、スクリプトによる
+// 洪水だけを落とす。バケットはメモリ上にあり Hibernation で消えるが、
+// その場合は満タンから再開するだけなので実害はない。
+const MSG_RATE_REFILL_PER_SEC = 60;
+const MSG_RATE_CAPACITY = 180;
+// storage 書き込みを伴うメッセージ(stroke:end / erase / page:add)は別枠でさらに絞る
+const WRITE_RATE_REFILL_PER_SEC = 10;
+const WRITE_RATE_CAPACITY = 60;
+
+const WRITE_MESSAGE_TYPES = new Set(["stroke:end", "erase", "page:add"]);
+
+interface RateBucket {
+  tokens: number;
+  last: number;
+}
+
+function takeToken(
+  buckets: WeakMap<WebSocket, RateBucket>,
+  ws: WebSocket,
+  capacity: number,
+  refillPerSec: number,
+): boolean {
+  const now = Date.now();
+  let b = buckets.get(ws);
+  if (!b) {
+    b = { tokens: capacity, last: now };
+    buckets.set(ws, b);
+  }
+  b.tokens = Math.min(capacity, b.tokens + ((now - b.last) / 1000) * refillPerSec);
+  b.last = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
 export class BoardRoom implements DurableObject {
+  private msgBuckets = new WeakMap<WebSocket, RateBucket>();
+  private writeBuckets = new WeakMap<WebSocket, RateBucket>();
+
   constructor(private state: DurableObjectState) {}
 
   async fetch(request: Request): Promise<Response> {
@@ -117,6 +157,17 @@ export class BoardRoom implements DurableObject {
     try {
       m = JSON.parse(message);
     } catch {
+      return;
+    }
+    // レート制限。超過したメッセージは黙って破棄する(切断はしない。描画中の
+    // 一時的なバーストで他ページへの影響なく自然に復帰できるようにするため)。
+    if (!takeToken(this.msgBuckets, ws, MSG_RATE_CAPACITY, MSG_RATE_REFILL_PER_SEC)) {
+      return;
+    }
+    if (
+      WRITE_MESSAGE_TYPES.has(m.type) &&
+      !takeToken(this.writeBuckets, ws, WRITE_RATE_CAPACITY, WRITE_RATE_REFILL_PER_SEC)
+    ) {
       return;
     }
     const user = ws.deserializeAttachment() as User;

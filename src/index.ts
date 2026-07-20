@@ -9,33 +9,50 @@ import {
   clearSessionCookie,
 } from "./auth";
 import {
+  countBoardsByCreator,
   countUsers,
   createBoard,
   createInvite,
   createUser,
+  deleteBoardMember,
   deleteBoardRow,
   deleteInvite,
   deleteUser,
   ensureSchema,
   getBoard,
+  getBoardMember,
+  getDefaultBoardVisibility,
   getGuestAccess,
   getInvite,
+  getMaxBoardsPerUser,
   getSessionSecret,
+  getUserById,
   getUserByLoginId,
   isInviteValid,
+  isMemberInviteEnabled,
   listAllBoards,
+  listBoardMembers,
   listBoardsByCreator,
+  listBoardsByMember,
   listInvites,
+  listInvitesByCreator,
   listUsers,
+  normalizeVisibility,
+  setBoardVisibility,
   setSetting,
   setUserStatus,
   touchBoard,
   tryConsumeInvite,
   updateUserPassword,
+  upsertBoardMember,
+  type BoardMemberRole,
+  type DbBoard,
   type DbUser,
 } from "./db";
 import {
+  accessDeniedPage,
   adminPage,
+  boardSettingsPage,
   homePage,
   inviteInvalidPage,
   invitePage,
@@ -105,15 +122,24 @@ const ACCOUNT_INPUT_ERROR =
 
 type BoardAccess =
   | { kind: "editor"; userId: string; userName: string }
+  // ログイン済みだがボードの role が viewer のメンバー(名前付き・書き込み不可)
+  | { kind: "viewer"; userId: string; userName: string }
   | { kind: "guest-editor" }
   | { kind: "guest-viewer" }
   | { kind: "denied-login-required" }
+  | { kind: "denied-forbidden" }
   | { kind: "denied-not-found" };
 
-// / (HTML)・/ws の両方で使う認可判定。ログイン済みなら常に許可(未登録ボードは
-// creator_id=NULL で遅延登録)。未ログインは settings.guest_access に従い、
-// ゲストは D1 に存在するボードにしかアクセスできない(遅延登録もしない = 適当な
-// URL で新規 DO を生成させない)。
+// / (HTML)・/ws の両方で使う認可判定(フェーズ3: ボード単位の visibility と
+// board_members を反映)。
+// - admin・作成者・オーナーメンバー: 常に編集可
+// - メンバー: 登録された役割(viewer は DO 側で書き込みを破棄)
+// - その他のログインユーザー: visibility が link / tenant なら編集可、
+//   restricted なら拒否。未登録ボードは creator_id=NULL・link で遅延登録
+//   (フェーズ3以前の URL 共有ボードの挙動を維持)
+// - 未ログイン: settings.guest_access に従い、visibility=link のボードのみ。
+//   D1 に存在するボードに限る(遅延登録もしない = 適当な URL で新規 DO を
+//   生成させない)
 async function resolveBoardAccess(
   c: AppContext,
   db: D1Database,
@@ -122,25 +148,90 @@ async function resolveBoardAccess(
   if (!isValidBoardId(boardId)) return { kind: "denied-not-found" };
   const user = await currentUser(c, db);
   if (user) {
-    const board = await getBoard(db, boardId);
+    let board = await getBoard(db, boardId);
     if (board) {
       await touchBoard(db, boardId);
     } else {
       try {
-        await createBoard(db, boardId, null);
+        await createBoard(db, boardId, null, "link");
       } catch {
         // 同時アクセスで既に登録済みだった場合は無視
         await touchBoard(db, boardId);
       }
+      board = await getBoard(db, boardId);
+      if (!board) return { kind: "denied-not-found" };
     }
-    return { kind: "editor", userId: user.id, userName: user.name };
+    const asEditor = { kind: "editor", userId: user.id, userName: user.name } as const;
+    if (user.role === "admin" || board.creator_id === user.id) return asEditor;
+    const membership = await getBoardMember(db, boardId, user.id);
+    if (membership) {
+      return membership.role === "viewer"
+        ? { kind: "viewer", userId: user.id, userName: user.name }
+        : asEditor;
+    }
+    if (normalizeVisibility(board.visibility) === "restricted") {
+      return { kind: "denied-forbidden" };
+    }
+    return asEditor;
   }
   const guestAccess = await getGuestAccess(db);
   if (guestAccess === "none") return { kind: "denied-login-required" };
   const board = await getBoard(db, boardId);
   if (!board) return { kind: "denied-not-found" };
+  // link 以外のボードはゲストに存在を明かさず、ログインへ誘導する
+  if (normalizeVisibility(board.visibility) !== "link") {
+    return { kind: "denied-login-required" };
+  }
   await touchBoard(db, boardId);
   return guestAccess === "view" ? { kind: "guest-viewer" } : { kind: "guest-editor" };
+}
+
+// ボードの共有設定(visibility・メンバー)を管理できるか:
+// admin、作成者、または role=owner のメンバー
+async function canManageBoard(
+  db: D1Database,
+  user: DbUser,
+  board: DbBoard,
+): Promise<boolean> {
+  if (user.role === "admin" || board.creator_id === user.id) return true;
+  const m = await getBoardMember(db, board.id, user.id);
+  return m?.role === "owner";
+}
+
+// /b/:id/settings 系ルートの共通ガード
+async function requireBoardManager(
+  c: AppContext,
+): Promise<{ db: D1Database; user: DbUser; board: DbBoard } | Response> {
+  if (!authEnabled(c.env)) return c.notFound();
+  const db = c.env.DB;
+  await ensureSchema(db);
+  const user = await currentUser(c, db);
+  if (!user) return c.redirect("/login");
+  const id = c.req.param("id") ?? "";
+  if (!isValidBoardId(id)) return c.notFound();
+  const board = await getBoard(db, id);
+  if (!board) return c.notFound();
+  if (!(await canManageBoard(db, user, board))) {
+    return c.html(accessDeniedPage(user), 403);
+  }
+  return { db, user, board };
+}
+
+async function renderBoardSettings(
+  c: AppContext,
+  db: D1Database,
+  user: DbUser,
+  board: DbBoard,
+  opts: { error?: string; success?: string } = {},
+) {
+  const [members, creator] = await Promise.all([
+    listBoardMembers(db, board.id),
+    board.creator_id ? getUserById(db, board.creator_id) : Promise.resolve(null),
+  ]);
+  return c.html(
+    boardSettingsPage({ user, board, members, creator, ...opts }),
+    opts.error ? 400 : 200,
+  );
 }
 
 async function requireAdmin(
@@ -167,9 +258,25 @@ app.get("/", async (c) => {
   await ensureSchema(db);
   const user = await currentUser(c, db);
   if (!user) return c.redirect("/login");
-  const boards = await listBoardsByCreator(db, user.id);
-  return c.html(homePage({ user, boards }));
+  return c.html(await buildHomePage(c, db, user));
 });
+
+// ホーム画面のデータ収集(エラー再表示でも使う)
+async function buildHomePage(
+  c: AppContext,
+  db: D1Database,
+  user: DbUser,
+  error?: string,
+): Promise<string> {
+  const canInvite = user.role === "admin" ? false : await isMemberInviteEnabled(db);
+  const [boards, memberBoards, invites] = await Promise.all([
+    listBoardsByCreator(db, user.id),
+    listBoardsByMember(db, user.id),
+    canInvite ? listInvitesByCreator(db, user.id) : Promise.resolve([]),
+  ]);
+  const origin = new URL(c.req.url).origin;
+  return homePage({ user, boards, memberBoards, invites, canInvite, origin, error });
+}
 
 app.get("/health", (c) =>
   c.json({
@@ -184,8 +291,18 @@ app.post("/boards/new", async (c) => {
   await ensureSchema(db);
   const user = await currentUser(c, db);
   if (!user) return c.redirect("/login");
+  // フェーズ2: ボード数クォータ(admin には適用しない)
+  if (user.role !== "admin") {
+    const max = await getMaxBoardsPerUser(db);
+    if (max > 0 && (await countBoardsByCreator(db, user.id)) >= max) {
+      return c.html(
+        await buildHomePage(c, db, user, `ボード数の上限(${max}件)に達しています。不要なボードを削除してください。`),
+        403,
+      );
+    }
+  }
   const id = crypto.randomUUID().replace(/-/g, "").slice(0, 10);
-  await createBoard(db, id, user.id);
+  await createBoard(db, id, user.id, await getDefaultBoardVisibility(db));
   return c.redirect(`/b/${id}`);
 });
 
@@ -197,7 +314,8 @@ app.post("/boards/:id/delete", async (c) => {
   if (!user) return c.redirect("/login");
   const id = c.req.param("id");
   const board = await getBoard(db, id);
-  if (board && board.creator_id === user.id) {
+  // 作成者、または role=owner のメンバーが削除できる(admin は /admin から)
+  if (board && (await canManageBoard(db, user, board))) {
     await deleteBoardEverywhere(c.env, id);
   }
   return c.redirect("/");
@@ -212,6 +330,9 @@ app.get("/b/:id", async (c) => {
   const access = await resolveBoardAccess(c, db, c.req.param("id"));
   if (access.kind === "denied-login-required") return c.redirect("/login");
   if (access.kind === "denied-not-found") return c.notFound();
+  if (access.kind === "denied-forbidden") {
+    return c.html(accessDeniedPage(await currentUser(c, db)), 403);
+  }
   return c.html(boardHtml);
 });
 
@@ -238,18 +359,85 @@ app.get("/b/:id/ws", async (c) => {
     return c.text("Login required", 401);
   }
   if (access.kind === "denied-not-found") return c.notFound();
+  if (access.kind === "denied-forbidden") return c.text("Forbidden", 403);
 
-  if (access.kind === "editor") {
+  if (access.kind === "editor" || access.kind === "viewer") {
     headers.set("X-User-Id", access.userId);
     // 表示名は任意文字列なので、ヘッダに安全に載せられるよう URL エンコードして渡す
     headers.set("X-User-Name", encodeURIComponent(access.userName));
-    headers.set("X-User-Role", "editor");
+    headers.set("X-User-Role", access.kind);
   } else if (access.kind === "guest-viewer") {
     headers.set("X-User-Role", "viewer");
   }
   // guest-editor はヘッダなし。DO 側が従来通り「ゲストN」を採番する。
   const req = new Request(c.req.raw, { headers });
   return c.env.BOARD.get(doId).fetch(req);
+});
+
+/* ---------- ボード共有設定(フェーズ3: visibility・メンバー) ---------- */
+
+app.get("/b/:id/settings", async (c) => {
+  const r = await requireBoardManager(c);
+  if (r instanceof Response) return r;
+  return renderBoardSettings(c, r.db, r.user, r.board);
+});
+
+app.post("/b/:id/settings/visibility", async (c) => {
+  const r = await requireBoardManager(c);
+  if (r instanceof Response) return r;
+  const form = await c.req.formData();
+  const value = String(form.get("visibility") ?? "");
+  if (value === "link" || value === "tenant" || value === "restricted") {
+    await setBoardVisibility(r.db, r.board.id, value);
+  }
+  return c.redirect(`/b/${r.board.id}/settings`);
+});
+
+app.post("/b/:id/settings/members/add", async (c) => {
+  const r = await requireBoardManager(c);
+  if (r instanceof Response) return r;
+  const form = await c.req.formData();
+  const loginId = String(form.get("login_id") ?? "").trim();
+  const role = String(form.get("role") ?? "editor") as BoardMemberRole;
+  if (role !== "viewer" && role !== "editor" && role !== "owner") {
+    return renderBoardSettings(c, r.db, r.user, r.board, { error: "役割の指定が不正です" });
+  }
+  const target = await getUserByLoginId(r.db, loginId);
+  if (!target) {
+    return renderBoardSettings(c, r.db, r.user, r.board, {
+      error: "そのログインIDのユーザーが見つかりません",
+    });
+  }
+  if (target.id === r.board.creator_id) {
+    return renderBoardSettings(c, r.db, r.user, r.board, {
+      error: "作成者は常にオーナーとしてアクセスできます(追加は不要です)",
+    });
+  }
+  await upsertBoardMember(r.db, r.board.id, target.id, role);
+  return c.redirect(`/b/${r.board.id}/settings`);
+});
+
+app.post("/b/:id/settings/members/update", async (c) => {
+  const r = await requireBoardManager(c);
+  if (r instanceof Response) return r;
+  const form = await c.req.formData();
+  const userId = String(form.get("user_id") ?? "");
+  const role = String(form.get("role") ?? "") as BoardMemberRole;
+  if (
+    (role === "viewer" || role === "editor" || role === "owner") &&
+    (await getBoardMember(r.db, r.board.id, userId))
+  ) {
+    await upsertBoardMember(r.db, r.board.id, userId, role);
+  }
+  return c.redirect(`/b/${r.board.id}/settings`);
+});
+
+app.post("/b/:id/settings/members/remove", async (c) => {
+  const r = await requireBoardManager(c);
+  if (r instanceof Response) return r;
+  const form = await c.req.formData();
+  await deleteBoardMember(r.db, r.board.id, String(form.get("user_id") ?? ""));
+  return c.redirect(`/b/${r.board.id}/settings`);
 });
 
 /* ---------- 初期設定(ブートストラップ) ---------- */
@@ -401,6 +589,47 @@ app.post("/invite/:token", async (c) => {
   return loginAndRedirect(c, db, id);
 });
 
+/* ---------- 招待(member 発行・フェーズ2) ---------- */
+
+// member_invite フラグ有効時に member がホーム画面から発行する。
+// admin が /admin から発行するより短い期限・少ない回数に制限する。
+app.post("/me/invites/new", async (c) => {
+  if (!authEnabled(c.env)) return c.notFound();
+  const db = c.env.DB;
+  await ensureSchema(db);
+  const user = await currentUser(c, db);
+  if (!user) return c.redirect("/login");
+  if (user.role !== "admin" && !(await isMemberInviteEnabled(db))) {
+    return c.text("Forbidden", 403);
+  }
+  const form = await c.req.formData();
+  const email = String(form.get("email") ?? "").trim() || null;
+  const days = Math.min(30, Math.max(1, Number(form.get("expires_days")) || 7));
+  const maxUses = Math.min(10, Math.max(1, Number(form.get("max_uses")) || 1));
+  const token = crypto.randomUUID().replace(/-/g, "");
+  await createInvite(db, {
+    token,
+    createdBy: user.id,
+    email,
+    expiresAt: Date.now() + days * 24 * 60 * 60 * 1000,
+    maxUses,
+  });
+  return c.redirect("/");
+});
+
+app.post("/me/invites/:token/delete", async (c) => {
+  if (!authEnabled(c.env)) return c.notFound();
+  const db = c.env.DB;
+  await ensureSchema(db);
+  const user = await currentUser(c, db);
+  if (!user) return c.redirect("/login");
+  const invite = await getInvite(db, c.req.param("token"));
+  if (invite && (invite.created_by === user.id || user.role === "admin")) {
+    await deleteInvite(db, invite.token);
+  }
+  return c.redirect("/");
+});
+
 /* ---------- 自分のパスワード変更 ---------- */
 
 app.get("/me/password", async (c) => {
@@ -453,14 +682,28 @@ app.get("/admin", async (c) => {
   const r = await requireAdmin(c);
   if (r instanceof Response) return r;
   const { db, user } = r;
-  const [boards, users, invites, guestAccess] = await Promise.all([
-    listAllBoards(db),
-    listUsers(db),
-    listInvites(db),
-    getGuestAccess(db),
-  ]);
+  const [boards, users, invites, guestAccess, maxBoardsPerUser, memberInviteEnabled] =
+    await Promise.all([
+      listAllBoards(db),
+      listUsers(db),
+      listInvites(db),
+      getGuestAccess(db),
+      getMaxBoardsPerUser(db),
+      isMemberInviteEnabled(db),
+    ]);
   const origin = new URL(c.req.url).origin;
-  return c.html(adminPage({ user, boards, users, invites, guestAccess, origin }));
+  return c.html(
+    adminPage({
+      user,
+      boards,
+      users,
+      invites,
+      guestAccess,
+      maxBoardsPerUser,
+      memberInviteEnabled,
+      origin,
+    }),
+  );
 });
 
 app.post("/admin/boards/:id/delete", async (c) => {
@@ -526,6 +769,18 @@ app.post("/admin/settings/guest_access", async (c) => {
   if (value === "none" || value === "view" || value === "edit") {
     await setSetting(r.db, "guest_access", value);
   }
+  return c.redirect("/admin");
+});
+
+// フェーズ2: クォータ(ボード数上限)とメンバー招待フラグ
+app.post("/admin/settings/policies", async (c) => {
+  const r = await requireAdmin(c);
+  if (r instanceof Response) return r;
+  const form = await c.req.formData();
+  const maxRaw = Number(form.get("max_boards_per_user"));
+  const max = Number.isInteger(maxRaw) ? Math.min(10000, Math.max(0, maxRaw)) : 0;
+  await setSetting(r.db, "max_boards_per_user", String(max));
+  await setSetting(r.db, "member_invite", form.get("member_invite") === "1" ? "1" : "0");
   return c.redirect("/admin");
 });
 
